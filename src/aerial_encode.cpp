@@ -62,7 +62,10 @@ const char* kUsage =
     "  --ocr MODE           florence (default; HaloCore door) | tesseract | none.\n"
     "                       A few reads per deduplicated object, spread over its frames,\n"
     "                       on a reader thread while the object layer runs on.\n"
-    "  --threads N          object-layer workers, one frame each (default 2 on 8+ cores, else 1)\n";
+    "  --threads N          object-layer workers, one frame each (default 2 on 8+ cores, else 1)\n"
+    "  --corrections PATH   analyst corrections applied to the object index after dedup\n"
+    "                       (default: corrections.json beside the object layer config, if present;\n"
+    "                       'none' to skip)\n";
 
 double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -214,6 +217,7 @@ struct Args {
     float conf = -1.0f;
     std::string ocr = "florence";
     int threads = 0;
+    std::string corrections;   // "" = corrections.json beside --objects if present; "none" = skip
 };
 
 Args parse(int argc, char** argv) {
@@ -235,6 +239,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--world-model") a.world_model = val();
         else if (k == "--conf") a.conf = std::stof(val());
         else if (k == "--threads") a.threads = std::stoi(val());
+        else if (k == "--corrections") a.corrections = val();
         else if (k == "--ocr") {
             a.ocr = val();
             if (a.ocr != "florence" && a.ocr != "tesseract" && a.ocr != "none") {
@@ -256,6 +261,95 @@ Args parse(int argc, char** argv) {
     std::exit(1);
 }
 
+/// One analyst correction to the object index (config/corrections.json,
+/// `objects[]`): the object `object_id` of the clip whose file stem is
+/// `video` (empty: any clip) gets `class`, or is dropped. `expect` guards a
+/// stale id: the object must still have that class and first frame, or the
+/// correction is skipped with a message. Object ids are deterministic for
+/// one object layer on one clip and renumber when the layer changes, which
+/// is what the guard is for.
+struct Correction {
+    std::string video;
+    long        object_id{-1};
+    std::string cls;            // new class; empty with drop
+    bool        drop{false};
+    std::string expect_cls;
+    int         expect_first{-1};
+    std::string note;
+};
+
+std::vector<Correction> load_corrections(const fs::path& path) {
+    std::vector<Correction> out;
+    std::ifstream in(path);
+    if (!in) die("cannot read corrections " + path.string());
+    const json j = json::parse(in);
+    for (const auto& c : j.value("objects", json::array())) {
+        Correction k;
+        k.video     = c.value("video", "");
+        k.object_id = c.value("object_id", -1L);
+        k.cls       = c.value("class", "");
+        k.drop      = c.value("drop", false);
+        k.note      = c.value("note", "");
+        if (c.contains("expect")) {
+            k.expect_cls   = c["expect"].value("class", "");
+            k.expect_first = c["expect"].value("first_frame", -1);
+        }
+        if (k.object_id < 0 || (k.cls.empty() && !k.drop))
+            die("corrections: each entry needs object_id and class (or drop:true): " + c.dump());
+        out.push_back(std::move(k));
+    }
+    return out;
+}
+
+/// Applies the corrections for this clip to the object index and the frame
+/// boxes that reference it, before anything is written: objects.jsonl, the
+/// overlay, the preview and the triples all see the corrected class. A
+/// relabelled object keeps what the heads said in `detected` and is
+/// `source: manual`; a dropped one leaves no box behind. Returns how many
+/// were applied; a skipped one (guard failed, id absent) is printed.
+int apply_corrections(const std::vector<Correction>& all, const std::string& stem,
+                      const std::vector<ehc::media::EncodedFrame>& encoded, std::vector<FrameRecord>& records,
+                      std::vector<ObjectEntry>& objects) {
+    int applied = 0;
+    for (const auto& c : all) {
+        if (!c.video.empty() && c.video != stem) continue;
+        const auto it = std::find_if(objects.begin(), objects.end(),
+                                     [&](const ObjectEntry& o) { return o.object_id == c.object_id; });
+        const auto skip = [&](const std::string& why) {
+            std::cout << "[aerial] correction skipped (object " << c.object_id << " -> "
+                      << (c.drop ? "drop" : c.cls) << "): " << why << std::endl;
+        };
+        if (it == objects.end()) { skip("no such object in this encode"); continue; }
+        const int first = it->survivors.empty() ? -1 : encoded[static_cast<size_t>(it->survivors.front())].meta.frame_idx;
+        if (!c.expect_cls.empty() && c.expect_cls != it->cls) {
+            skip("expected class " + c.expect_cls + ", the encode says " + it->cls); continue;
+        }
+        if (c.expect_first >= 0 && c.expect_first != first) {
+            skip("expected first frame " + std::to_string(c.expect_first) + ", the encode says " + std::to_string(first));
+            continue;
+        }
+        if (c.drop) {
+            for (auto& rec : records)
+                rec.boxes.erase(std::remove_if(rec.boxes.begin(), rec.boxes.end(),
+                                               [&](const Box& b) { return b.object_id == c.object_id; }),
+                                rec.boxes.end());
+            objects.erase(it);
+        } else {
+            it->detected = it->cls;
+            it->cls = c.cls;
+            it->source = "manual";
+            it->manual = true;
+            for (auto& rec : records)
+                for (auto& b : rec.boxes)
+                    if (b.object_id == c.object_id) { b.cls = c.cls; b.source = "manual"; }
+        }
+        std::cout << "[aerial] correction: object " << c.object_id << " " << (c.drop ? "dropped" : "-> " + c.cls)
+                  << (c.note.empty() ? "" : "  (" + c.note + ")") << std::endl;
+        ++applied;
+    }
+    return applied;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -268,6 +362,21 @@ int main(int argc, char** argv) {
         die("--frame must be WxH, for example 640x640");
     const int frame_w = std::stoi(spec.substr(0, x)), frame_h = std::stoi(spec.substr(x + 1));
     if (frame_w < 320 || frame_h < 320) die("--frame below 320x320 is too small for YOLO and OCR");
+
+    std::vector<Correction> corrections;
+    {
+        fs::path cpath;
+        if (args.corrections == "none") {
+        } else if (!args.corrections.empty()) {
+            cpath = args.corrections;
+        } else if (fs::path sib = fs::path(args.objects).parent_path() / "corrections.json"; fs::exists(sib)) {
+            cpath = sib;
+        }
+        if (!cpath.empty()) {
+            corrections = load_corrections(cpath);
+            std::cout << "[aerial] corrections: " << corrections.size() << " from " << cpath.string() << std::endl;
+        }
+    }
 
     fs::create_directories(args.out_dir);
     std::set<std::string> exts;
@@ -396,6 +505,8 @@ int main(int argc, char** argv) {
             records.clear();
             objects.clear();
         }
+        const int n_corrected = records.empty() ? 0
+                                                : apply_corrections(corrections, src.stem().string(), encoded, records, objects);
 
         vid_log << vmeta.dump() << "\n";
         // The objects that become facts (config objects.min_frames / min_confidence).
@@ -432,6 +543,7 @@ int main(int argc, char** argv) {
             object_log << json{{"object_id", o.object_id}, {"video_id", vid_id}, {"class", o.cls},
                                {"source", o.source}, {"confidence", o.confidence}, {"ocr", o.ocr},
                                {"fact", facts.count(o.object_id) > 0},
+                               {"detected", o.manual ? json(o.detected) : json(o.cls)},
                                {"host_id", o.host_id >= 0 ? json(o.host_id) : json(nullptr)},
                                {"first_ts_ms", seen.front()["ts_ms"]}, {"last_ts_ms", seen.back()["ts_ms"]},
                                {"best", {{"frame_idx", best.frame_idx}, {"ts_ms", best.ts_ms},
@@ -449,7 +561,8 @@ int main(int argc, char** argv) {
                         {"input_frames", n_input}, {"frames_seen", st.frames_seen},
                         {"dropped_phash", st.dropped_phash}, {"dropped_vsa", st.dropped_vsa},
                         {"dropped_stage2", st.dropped_stage2}, {"survivors_kept", encoded.size()},
-                        {"objects", objects.size()}, {"detect_seconds", detector->timing()},
+                        {"objects", objects.size()}, {"corrections_applied", n_corrected},
+                        {"detect_seconds", detector->timing()},
                         {"detector_tokens_emitted", st.detector_tokens_emitted},
                         {"detector_tokens_dropped", st.detector_tokens_dropped}}.dump()
                 << "\n";

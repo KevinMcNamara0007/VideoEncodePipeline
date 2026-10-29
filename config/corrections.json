@@ -1,0 +1,26 @@
+{
+  "_doc": "Analyst corrections to the object index, applied by aerial_encode after dedup and before anything is written, so objects.jsonl, the overlay, the painted preview, the index sidecar and the triples all carry the corrected class. objects[]: video = the clip's file stem (omit for any clip); object_id = the object in that clip's objects.jsonl; class = the new class, or drop: true to remove the object (a duplicate detection of something already tracked); expect = {class, first_frame} the object must still have, or the correction is skipped with a message (object ids are deterministic for one object layer on one clip and renumber when the layer changes); note = why. A relabelled object is source 'manual', keeps what the heads said in 'detected', and counts as corroborated. The default file is corrections.json beside object_layer.json; --corrections PATH|none overrides.",
+  "objects": [
+    {
+      "video": "drone_raw",
+      "object_id": 151,
+      "class": "tank",
+      "expect": {"class": "boat", "first_frame": 239},
+      "note": "M1 Abrams T441 close-up, frames 239-260: COCO calls the hull a boat at 0.86 and the World 'military tank' prompt reaches 0.32 here"
+    },
+    {
+      "video": "drone_raw",
+      "object_id": 152,
+      "drop": true,
+      "expect": {"class": "boat", "first_frame": 243},
+      "note": "second box on the same T441 tank in frame 243 (one look, 0.26)"
+    },
+    {
+      "video": "drone_raw",
+      "object_id": 156,
+      "drop": true,
+      "expect": {"class": "boat", "first_frame": 252},
+      "note": "second box on the same T441 tank in frame 252 (one look, 0.30)"
+    }
+  ]
+}

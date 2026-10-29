@@ -71,6 +71,8 @@ struct ObjectEntry {
     std::map<std::string, std::string> sources; // detected class -> head
     int                      best_survivor{-1}; // the frame its crop was read from
     double                   best_xyxy[4]{0, 0, 0, 0};
+    bool                     manual{false};     // class set by a correction (config/corrections.json)
+    std::string              detected;          // the voted class a correction replaced
 };
 
 /// config/object_layer.json, with paths resolved against `root`.
@@ -102,11 +104,13 @@ struct ObjectLayerConfig {
     /// 0.20) so tracks stay continuous; a fact needs corroboration: the
     /// object seen on fact_min_frames survivors, or once at or above
     /// fact_min_confidence. An uncorroborated object stays in objects.jsonl
-    /// and the overlay (painted grey) but emits no triple.
+    /// and the overlay (painted grey) but emits no triple. A human
+    /// correction is the strongest corroboration there is.
     double fact_min_confidence{0.4};
     int    fact_min_frames{2};
     bool corroborated(const ObjectEntry& o) const {
-        return static_cast<int>(o.survivors.size()) >= fact_min_frames || o.confidence >= fact_min_confidence;
+        return o.manual || static_cast<int>(o.survivors.size()) >= fact_min_frames ||
+               o.confidence >= fact_min_confidence;
     }
 
     static ObjectLayerConfig load(const std::string& path, const std::string& root);

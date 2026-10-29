@@ -377,6 +377,24 @@ With the floor: 14 tank objects become 6 (five real, one 0.47 shot of a
 truck's underside), the three "humvee" objects go, 30 objects of 198 are
 withheld in all and the clip's triples go from 3,330 to 3,266.
 
+**Corrections.** What the heads cannot get right, an analyst can say once:
+`config/corrections.json` (or `--corrections PATH`, `none` to skip) lists
+objects by clip stem and `object_id` with a new `class`, or `drop: true`
+for a duplicate detection of something already tracked. The encoder
+applies them after dedup and before anything is written, so
+`objects.jsonl` (`source: manual`, the heads' label kept in `detected`),
+the overlay, the painted preview, the index sidecar and the triples all
+carry the correction, and a corrected object counts as corroborated. An
+`expect: {class, first_frame}` guards each entry: object ids are
+deterministic for one object layer on one clip and renumber when the layer
+changes, and a guard that no longer holds skips the entry with a message
+instead of relabelling the wrong thing. The first use: the M1 Abrams T441
+close-up (object 151, frames 239 to 260) is "boat" to COCO at 0.86 while
+the World "military tank" prompt reaches 0.32, so the class vote lost; the
+correction makes it `tank` and drops the two one-look duplicate boxes on
+it (152, 156). This is a per-clip override, not a fix for the detector; the
+detector fix stays on the open list.
+
 Measured on `input/drone_raw.mp4` (3,330 triples, 383 subjects, every
 relation surfaced): of the 75 questions, 57 answer with a fact that is in
 the triples and 18 decline. Every decline is a fact that is not there: the

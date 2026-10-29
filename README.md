@@ -27,7 +27,9 @@ heads to ONNX the first time, encodes `input/` into `out/`, and writes
 labelled `class #object_id  TEXT`. `out/objects.jsonl` is the object index.
 An object becomes a fact for the appliance only when it is corroborated
 (seen on two frames, or once at confidence 0.4 or better; `objects` in the
-layer config); a withheld one is painted grey in the preview.
+layer config); a withheld one is painted grey in the preview. What the
+heads get wrong, `config/corrections.json` can relabel or drop by object
+id, applied at encode so the preview, the index and the lake agree.
 
 Put the clip into the appliance:
 
