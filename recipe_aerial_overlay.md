@@ -301,11 +301,15 @@ show plate B127" directly.
 build/aerial_paint out output/preview.mp4
 ```
 
-Each survivor is seeked at `ts_ms / 1000` (input seek, after `-i`, so the
-frame matches the sample clock closely), boxes are scaled onto the source
-frame and labelled `class #object_id  TEXT  confidence`: the same `#id` on
-two frames is one object. Survivors play at 2 fps (`--hold 0.5`). A class
-keeps its colour from run to run.
+Each source is decoded once, through the same `FFmpegFramePipe` and `fps`
+filter the encoder sampled it with (`config.json` `target_fps`), at source
+size: survivor `frame_idx` N is frame N of that stream, the exact frame the
+boxes were found on. Boxes are scaled onto it and labelled
+`class #object_id  TEXT  confidence`: the same `#id` on two frames is one
+object. Survivors play at 2 fps (`--hold 0.5`). A class keeps its colour
+from run to run. On `drone_raw.mp4` (326 survivors) this takes 8 s; the
+earlier one-seek-per-survivor version decoded from the start of the file
+for every survivor and took 3 min 52 s.
 
 ## 5. Ingest through the HaloCore front door
 

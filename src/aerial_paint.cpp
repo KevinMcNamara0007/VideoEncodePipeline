@@ -13,7 +13,14 @@
 /// scaled by src_w/frame_w and src_h/frame_h, matching ffmpeg scale=W:H
 /// (stretched, not letterboxed).
 ///
+/// Each source is decoded once, through the same FFmpegFramePipe and fps
+/// filter the encoder sampled it with (config.json target_fps), at source
+/// size: survivor frame_idx N is frame N of that stream, exactly the frame
+/// the boxes were found on. (One seek per survivor decoded from the start
+/// each time: 326 survivors took 3 min 52 s. One pass takes seconds.)
+///
 ///     aerial_paint <out_dir> <preview.mp4> [--hold 0.5]
+#include "ehc/media/ffmpeg_pipe.hpp"
 #include "ehc/util/subprocess.hpp"
 
 #include <nlohmann/json.hpp>
@@ -26,6 +33,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -34,26 +42,23 @@ using json = nlohmann::json;
 
 namespace {
 
-std::string input_token(const std::string& path) {
-    std::error_code ec;
-    return fs::exists(path, ec) ? "file:" + path : path;
-}
-
-/// One frame at ts_ms. Seek after -i so the sample clock stays close.
-cv::Mat grab_frame(const std::string& source, double ts_ms) {
-    char sec[32];
-    std::snprintf(sec, sizeof sec, "%.3f", std::max(0.0, ts_ms / 1000.0));
-    std::string png;
-    try {
-        png = ehc::util::Subprocess::capture({"ffmpeg", "-nostdin", "-loglevel", "error", "-i", input_token(source),
-                                              "-ss", sec, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png",
-                                              "-"});
-    } catch (const std::exception&) {
-        return {};
+/// The rate the encoder sampled at: config.json target_fps, else the ratio
+/// frame_idx / ts_ms of the first row that has one, else 2.
+double sample_fps(const fs::path& out_dir, const std::vector<json>& rows) {
+    std::ifstream in(out_dir / "config.json");
+    if (in) {
+        try {
+            const json cfg = json::parse(in);
+            if (cfg.contains("target_fps") && cfg["target_fps"].is_number() && cfg["target_fps"].get<double>() > 0)
+                return cfg["target_fps"].get<double>();
+        } catch (const std::exception&) {
+        }
     }
-    if (png.empty()) return {};
-    const cv::Mat buf(1, static_cast<int>(png.size()), CV_8UC1, png.data());
-    return cv::imdecode(buf, cv::IMREAD_COLOR);
+    for (const auto& r : rows) {
+        const double idx = r.value("frame_idx", 0.0), ts = r.value("ts_ms", 0.0);
+        if (idx > 0 && ts > 0) return idx * 1000.0 / ts;
+    }
+    return 2.0;
 }
 
 /// A stable colour per label (FNV-1a), so a class keeps its colour across runs.
@@ -143,26 +148,56 @@ int main(int argc, char** argv) {
 
     const fs::path plates = out_dir / "preview_frames";
     fs::create_directories(plates);
-    std::vector<fs::path> written;
+    const double fps = sample_fps(out_dir, rows);
+
+    // Rows by source, in file order; each source is decoded once.
+    std::vector<std::string> sources;
+    std::map<std::string, std::map<int, std::vector<size_t>>> wanted;   // source -> frame_idx -> rows
     for (size_t i = 0; i < rows.size(); ++i) {
-        const auto& row = rows[i];
-        const double ts = row.contains("ts_ms") && row["ts_ms"].is_number() ? row["ts_ms"].get<double>() : 0.0;
-        cv::Mat img = grab_frame(row.value("source_path", ""), ts);
-        if (img.empty()) {
-            std::cerr << "[paint] skip row " << i << ": no frame from " << row.value("source_path", "") << "\n";
+        const std::string src = rows[i].value("source_path", "");
+        if (!wanted.count(src)) sources.push_back(src);
+        wanted[src][rows[i].value("frame_idx", 0)].push_back(i);
+    }
+    std::vector<fs::path> painted(rows.size());
+    size_t n_painted = 0;
+    for (const auto& src : sources) {
+        auto& by_idx = wanted[src];
+        const json& first = rows[by_idx.begin()->second.front()];
+        const int src_w = first.value("src_w", 0), src_h = first.value("src_h", 0);
+        if (src.empty() || src_w <= 0 || src_h <= 0) {
+            std::cerr << "[paint] skip " << by_idx.size() << " row(s): no source size for '" << src << "'\n";
             continue;
         }
-        draw_row(img, row);
-        // yuv420p wants even sizes
-        if (img.cols % 2 || img.rows % 2)
-            cv::copyMakeBorder(img, img, 0, img.rows % 2, 0, img.cols % 2, cv::BORDER_REPLICATE);
-        char name[32];
-        std::snprintf(name, sizeof name, "frame_%05zu.png", i);
-        const fs::path path = plates / name;
-        cv::imwrite(path.string(), img);
-        written.push_back(path);
+        const int last = by_idx.rbegin()->first;
+        ehc::media::FFmpegFramePipe pipe(src, fps, src_w, src_h, ehc::media::ColorMode::rgb);
+        while (auto f = pipe.next()) {
+            if (f->frame_idx > last) break;
+            const auto it = by_idx.find(f->frame_idx);
+            if (it == by_idx.end()) continue;
+            cv::Mat img;
+            cv::cvtColor(cv::Mat(f->h, f->w, CV_8UC3, const_cast<uint8_t*>(f->data)), img, cv::COLOR_RGB2BGR);
+            for (size_t i : it->second) {
+                cv::Mat plate = it->second.size() > 1 ? img.clone() : img;
+                draw_row(plate, rows[i]);
+                // yuv420p wants even sizes
+                if (plate.cols % 2 || plate.rows % 2)
+                    cv::copyMakeBorder(plate, plate, 0, plate.rows % 2, 0, plate.cols % 2, cv::BORDER_REPLICATE);
+                char name[32];
+                std::snprintf(name, sizeof name, "frame_%05zu.png", i);
+                painted[i] = plates / name;
+                cv::imwrite(painted[i].string(), plate);
+                ++n_painted;
+            }
+            by_idx.erase(it);
+        }
+        if (!by_idx.empty())
+            std::cerr << "[paint] " << src << ": " << by_idx.size() << " survivor frame(s) not in the stream"
+                      << (ehc::util::Subprocess::status_failed(pipe.exit_status()) ? " (ffmpeg failed)" : "") << "\n";
     }
-    if (written.empty()) die("no frames painted");
+    if (n_painted == 0) die("no frames painted");
+    std::vector<fs::path> written;
+    for (const auto& p : painted)
+        if (!p.empty()) written.push_back(p);
 
     // Concat resolves relative paths from the list file's directory.
     const fs::path lst = out_dir / "preview_frames.txt";
