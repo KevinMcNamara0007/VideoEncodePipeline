@@ -389,11 +389,14 @@ carry the correction, and a corrected object counts as corroborated. An
 deterministic for one object layer on one clip and renumber when the layer
 changes, and a guard that no longer holds skips the entry with a message
 instead of relabelling the wrong thing. The first use: the M1 Abrams T441
-close-up (object 151, frames 239 to 260) is "boat" to COCO at 0.86 while
-the World "military tank" prompt reaches 0.32, so the class vote lost; the
-correction makes it `tank` and drops the two one-look duplicate boxes on
-it (152, 156). This is a per-clip override, not a fix for the detector; the
-detector fix stays on the open list.
+close-up is "truck" to COCO at 0.90 head-on (object 149, frames 229 to
+235) and "boat" at 0.86 from the side (object 151, frames 239 to 260) while
+the World "military tank" prompt reaches 0.32, so the class vote lost both
+times; the corrections make both `tank` and drop the two one-look
+duplicate boxes on the second (152, 156). "What is T441 shown in?" and
+"What is the tank shown in?" then both reach it. This is a per-clip
+override, not a fix for the detector; the detector fix stays on the open
+list.
 
 Measured on `input/drone_raw.mp4` (3,330 triples, 383 subjects, every
 relation surfaced): of the 75 questions, 57 answer with a fact that is in

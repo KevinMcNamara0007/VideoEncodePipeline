@@ -3,6 +3,13 @@
   "objects": [
     {
       "video": "drone_raw",
+      "object_id": 149,
+      "class": "tank",
+      "expect": {"class": "truck", "first_frame": 229},
+      "note": "the same M1 Abrams T441 head-on, frames 229-235, before the track broke at the cut: COCO calls it a truck at 0.90"
+    },
+    {
+      "video": "drone_raw",
       "object_id": 151,
       "class": "tank",
       "expect": {"class": "boat", "first_frame": 239},
