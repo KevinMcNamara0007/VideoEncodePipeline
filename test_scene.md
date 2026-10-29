@@ -1,6 +1,6 @@
 # EWORLD test scene
 
-The plate has to move. A locked camera and parked vehicles produce an empty encode. `higgsfield_scene.py` submits these beats to Cinema Studio 4.0 with `pacing: dynamic` and a camera move on every shot. Vehicles drive, people walk, aircraft cross.
+The plate has to move. A locked camera and parked vehicles produce an empty encode. Generate these beats (Higgsfield Cinema Studio 4.0 made the original clip) with `pacing: dynamic` and a camera move on every shot. Vehicles drive, people walk, aircraft cross.
 
 Aerial pass over a daylight training range. Markings are large and face the lens long enough for a 2 fps, 640×640 sample to read them.
 
