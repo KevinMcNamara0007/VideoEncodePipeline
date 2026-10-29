@@ -7,17 +7,25 @@
 // ------------------------------------------------------------------------
 #include "aerial_detector.hpp"
 
+#include <opencv2/core/utility.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
+#include <thread>
 #include <unistd.h>
 
 namespace eworld {
@@ -30,6 +38,23 @@ namespace {
 constexpr const char* kText = "text";
 
 bool starts_with(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
+
+double now_s() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/// Adds the seconds since construction to `slot` at stop() or when it dies.
+struct Stopwatch {
+    double& slot;
+    double  t0{now_s()};
+    bool    live{true};
+    explicit Stopwatch(double& s) : slot(s) {}
+    void stop() {
+        if (live) slot += now_s() - t0;
+        live = false;
+    }
+    ~Stopwatch() { stop(); }
+};
 
 /// How much of `inner` lies inside `outer` (0..1).
 double containment(const double inner[4], const double outer[4]) {
@@ -91,6 +116,14 @@ std::vector<size_t> spread(size_t count, int n) {
     return out;
 }
 
+/// The object's class: the detected label with the most summed confidence.
+void vote(ObjectEntry& o) {
+    const auto top = std::max_element(o.votes.begin(), o.votes.end(),
+                                      [](const auto& a, const auto& b) { return a.second < b.second; });
+    o.cls = top->first;
+    o.source = o.sources.at(top->first);
+}
+
 }  // namespace
 
 ObjectLayerConfig ObjectLayerConfig::load(const std::string& path, const std::string& root) {
@@ -135,6 +168,7 @@ ObjectLayerConfig ObjectLayerConfig::load(const std::string& path, const std::st
         c.ocr_min_side = j["ocr"].value("min_side", 48);
         c.ocr_pad      = j["ocr"].value("pad", 0.1);
         c.ocr_views    = j["ocr"].value("views", 3);
+        c.ocr_batch    = std::max(1, j["ocr"].value("batch", 32));
         for (const auto& k : j["ocr"].value("skip", nlohmann::json::array())) c.ocr_skip.insert(k.get<std::string>());
     }
     return c;
@@ -155,39 +189,177 @@ nlohmann::ordered_json ObjectLayerConfig::to_json() const {
             {"text", {{"enabled", text_enabled}, {"psm", text_psm}, {"min_conf", text_min_conf},
                       {"min_height", text_min_height}, {"pad", text_pad},
                       {"host_containment", text_host_containment}}},
-            {"ocr", {{"min_side", ocr_min_side}, {"pad", ocr_pad}, {"views", ocr_views}, {"skip", ocr_skip}}}};
+            {"ocr", {{"min_side", ocr_min_side}, {"pad", ocr_pad}, {"views", ocr_views}, {"batch", ocr_batch},
+                     {"skip", ocr_skip}}}};
 }
+
+// ── the reader thread ─────────────────────────────────────────────────────
+
+/// Reads closed objects' views as they arrive, in batches, on its own
+/// thread. Results are keyed by object index and merged by the caller after
+/// join(): objects_ grows on the tracking thread meanwhile.
+class AerialDetector::Reader {
+public:
+    Reader(HaloFlorence* florence, Tesseract* tess, int batch)
+        : florence_(florence), tess_(tess), batch_(batch), thread_([this] { loop(); }) {}
+    ~Reader() {
+        if (thread_.joinable()) join();
+    }
+    void submit(std::vector<View> views) {
+        {
+            std::lock_guard<std::mutex> g(m_);
+            for (auto& v : views) queue_.push_back(std::move(v));
+        }
+        cv_.notify_one();
+    }
+    /// Closes the queue and waits for the last batch.
+    void join() {
+        {
+            std::lock_guard<std::mutex> g(m_);
+            done_ = true;
+        }
+        cv_.notify_one();
+        thread_.join();
+    }
+    std::map<size_t, std::vector<Read>>& reads() { return reads_; }
+    double busy_s() const { return busy_s_; }
+    size_t views_read() const { return n_views_; }
+    size_t batches() const { return n_batches_; }
+
+private:
+    void loop() {
+        for (;;) {
+            std::vector<View> batch;
+            {
+                std::unique_lock<std::mutex> g(m_);
+                // A full batch, or whatever is left once the queue closes:
+                // a door call loads the model, so a call should carry many
+                // views, and objects close one or two at a time.
+                cv_.wait(g, [this] { return done_ || queue_.size() >= static_cast<size_t>(batch_); });
+                if (queue_.empty()) return;
+                while (!queue_.empty() && batch.size() < static_cast<size_t>(batch_)) {
+                    batch.push_back(std::move(queue_.front()));
+                    queue_.pop_front();
+                }
+            }
+            const double t0 = now_s();
+            read(batch);
+            busy_s_ += now_s() - t0;
+            n_views_ += batch.size();
+            ++n_batches_;
+        }
+    }
+    void read(const std::vector<View>& views) {
+        auto take = [&](size_t object, std::vector<std::string> words) {
+            reads_[object].push_back(Read{std::move(words), florence_ != nullptr});
+        };
+        if (florence_) {
+            std::error_code ec;
+            const fs::path dir = fs::temp_directory_path(ec) /
+                                 ("eworld_objects_" + std::to_string(::getpid()) + "_" + std::to_string(n_batches_));
+            fs::create_directories(dir, ec);
+            std::vector<std::string> paths;
+            for (const auto& v : views) {
+                const fs::path p = dir / (v.name + ".png");
+                cv::imwrite(p.string(), v.crop);
+                paths.push_back(p.string());
+            }
+            const auto texts = florence_->read_many(paths);
+            for (const auto& v : views) {
+                const auto it = texts.find(v.name);
+                if (it != texts.end()) take(v.object, figure_words(it->second));
+            }
+            fs::remove_all(dir, ec);
+        } else if (tess_) {
+            for (const auto& v : views) {
+                std::vector<std::string> words;
+                for (const auto& word : tess_->words(v.crop, 6)) {
+                    const auto tok = ocr_token(word.text);
+                    if (tok && keep_stencil(tok->substr(4))) words.push_back(tok->substr(4));
+                }
+                take(v.object, std::move(words));
+            }
+        }
+    }
+
+    HaloFlorence* florence_;
+    Tesseract*    tess_;
+    int           batch_;
+    std::mutex              m_;
+    std::condition_variable cv_;
+    std::deque<View>        queue_;
+    bool                    done_{false};
+    std::map<size_t, std::vector<Read>> reads_;
+    double busy_s_{0};
+    size_t n_views_{0}, n_batches_{0};
+    std::thread thread_;
+};
+
+// ── the detector ──────────────────────────────────────────────────────────
 
 AerialDetector::AerialDetector(DetectorOptions opt) : opt_(std::move(opt)) {
     const auto& L = opt_.layer;
-    coco_ = std::make_unique<YoloHead>(L.coco_model, opt_.imgsz);
+    const int cores = std::max(1u, std::thread::hardware_concurrency());
+    // A YOLO forward spreads over OpenCV's thread pool already; a second
+    // frame in flight fills the cores the pool leaves idle between layers
+    // (16 cores, 326 frames: 1 worker 153 s, 2 workers 126 s, 4 workers
+    // 136 s), and the reader thread needs cores too.
+    const int workers = opt_.workers > 0 ? opt_.workers : (cores >= 8 ? 2 : 1);
+    // The reader shares the cores with the workers: a quarter of them keeps
+    // the layer at its solo pace, and the reads still finish under it.
+    if (const char* f = std::getenv("HALOCORE_FIGURES_THREADS"); !f || !*f)
+        ::setenv("HALOCORE_FIGURES_THREADS", std::to_string(std::clamp(cores / 4, 1, 8)).c_str(), 0);
+    // The door's figure pass describes a picture three ways (object labels,
+    // text, a long caption); only the text is used here, and the caption is
+    // half the pass. Needs a door that knows HALOCORE_FIGURES_TASKS; an
+    // older one runs all three.
+    ::setenv("HALOCORE_FIGURES_TASKS", "ocr", 0);
+    heads_.resize(static_cast<size_t>(workers));
+    for (auto& h : heads_) {
+        h.coco = std::make_unique<YoloHead>(L.coco_model, opt_.imgsz);
+        if (!L.world_model.empty()) h.world = std::make_unique<YoloHead>(L.world_model, opt_.imgsz);
+        if (L.text_enabled && opt_.ocr != "none") h.scout = std::make_unique<Tesseract>();
+    }
+    const Heads& h0 = heads_.front();
     for (const auto& k : L.coco_keep)
-        if (std::find(coco_->names().begin(), coco_->names().end(), k) == coco_->names().end())
+        if (std::find(h0.coco->names().begin(), h0.coco->names().end(), k) == h0.coco->names().end())
             throw std::runtime_error("coco.keep names '" + k + "', which " + L.coco_model + " does not have");
-    if (!L.world_model.empty()) {
-        world_ = std::make_unique<YoloHead>(L.world_model, opt_.imgsz);
+    if (h0.world) {
         // The graph answers the prompts it was exported with; they must be the config's.
-        std::set<std::string> have(world_->names().begin(), world_->names().end()), want;
+        std::set<std::string> have(h0.world->names().begin(), h0.world->names().end()), want;
         for (const auto& [p, t] : L.world_tokens) want.insert(p);
         if (have != want)
             throw std::runtime_error(L.world_model + " was exported with other prompts than the config's "
                                      "world.prompts; export it again (run.sh does when the file is missing)");
     }
     if (opt_.ocr == "florence") {
-        std::cout << "[aerial] Florence-2 is the HaloCore door (OCR per object, " << L.ocr_views << " view(s))"
-                  << std::endl;
+        std::cout << "[aerial] Florence-2 is the HaloCore door (OCR per object, " << L.ocr_views
+                  << " view(s), batches of " << L.ocr_batch << ", tasks "
+                  << (std::getenv("HALOCORE_FIGURES_TASKS") ? std::getenv("HALOCORE_FIGURES_TASKS") : "od,ocr,caption")
+                  << ", " << std::getenv("HALOCORE_FIGURES_THREADS") << " threads)" << std::endl;
         florence_ = std::make_unique<HaloFlorence>();
     } else if (opt_.ocr == "tesseract") {
         tess_ = std::make_unique<Tesseract>();
     }
-    if (L.text_enabled && opt_.ocr != "none") scout_ = std::make_unique<Tesseract>();
+    std::cout << "[aerial] object layer: " << workers << " worker(s) on " << cores << " cores" << std::endl;
 }
 
-std::vector<Box> AerialDetector::object_layer(const cv::Mat& bgr) {
+AerialDetector::~AerialDetector() = default;
+
+std::vector<Box> AerialDetector::object_layer(Heads& h, const cv::Mat& bgr) const {
     const auto& L = opt_.layer;
     std::vector<Box> all;
-    for (const auto& yb : coco_->predict(bgr, L.coco_conf)) {
-        const std::string& name = coco_->names()[static_cast<size_t>(yb.cls)];
+    std::vector<YoloBox> coco_boxes, world_boxes;
+    {
+        Stopwatch sw(h.coco_s);
+        coco_boxes = h.coco->predict(bgr, L.coco_conf);
+    }
+    if (h.world) {
+        Stopwatch sw(h.world_s);
+        world_boxes = h.world->predict(bgr, L.world_conf);
+    }
+    for (const auto& yb : coco_boxes) {
+        const std::string& name = h.coco->names()[static_cast<size_t>(yb.cls)];
         if (!L.coco_keep.count(name)) continue;
         Box b;
         b.cls = b.detected = name;
@@ -196,15 +368,13 @@ std::vector<Box> AerialDetector::object_layer(const cv::Mat& bgr) {
         b.source = "coco";
         all.push_back(b);
     }
-    if (world_) {
-        for (const auto& yb : world_->predict(bgr, L.world_conf)) {
-            Box b;
-            b.cls = b.detected = L.world_tokens.at(world_->names()[static_cast<size_t>(yb.cls)]);
-            b.confidence = yb.conf;
-            std::copy(yb.xyxy, yb.xyxy + 4, b.xyxy);
-            b.source = "world";
-            all.push_back(b);
-        }
+    for (const auto& yb : world_boxes) {
+        Box b;
+        b.cls = b.detected = L.world_tokens.at(h.world->names()[static_cast<size_t>(yb.cls)]);
+        b.confidence = yb.conf;
+        std::copy(yb.xyxy, yb.xyxy + 4, b.xyxy);
+        b.source = "world";
+        all.push_back(b);
     }
     // Class-agnostic merge across both heads: most confident first, and a box
     // overlapping a kept one is the same object.
@@ -219,15 +389,20 @@ std::vector<Box> AerialDetector::object_layer(const cv::Mat& bgr) {
     return kept;
 }
 
-std::vector<Box> AerialDetector::text_boxes(const cv::Mat& bgr) {
+std::vector<Box> AerialDetector::text_boxes(Heads& h, const cv::Mat& bgr) const {
     const auto& L = opt_.layer;
     std::vector<Box> out;
-    if (!scout_ || bgr.empty()) return out;
+    if (!h.scout || bgr.empty()) return out;
     // Words that look like a stencil. The scout's spelling is not kept:
     // Florence reads the line.
     struct W { double b[4]; double conf; std::string token; };
     std::vector<W> words;
-    for (const auto& w : scout_->words(bgr, L.text_psm)) {
+    std::vector<OcrWord> scouted;
+    {
+        Stopwatch sw(h.scout_s);
+        scouted = h.scout->words(bgr, L.text_psm);
+    }
+    for (const auto& w : scouted) {
         const auto tok = ocr_token(w.text);
         if (!tok || !keep_stencil(tok->substr(4)) || w.conf < L.text_min_conf) continue;
         if (w.xyxy[3] - w.xyxy[1] < L.text_min_height) continue;
@@ -280,60 +455,28 @@ std::vector<Box> AerialDetector::text_boxes(const cv::Mat& bgr) {
     return out;
 }
 
-void AerialDetector::read_objects(const std::vector<cv::Mat>& images) {
+std::vector<AerialDetector::View> AerialDetector::views_of(size_t object, const std::vector<cv::Mat>& images) const {
     const auto& L = opt_.layer;
-    struct View { size_t object; std::string name; cv::Mat crop; };
+    const ObjectEntry& o = objects_[object];
     std::vector<View> views;
-    size_t n_objects = 0;
-    for (size_t i = 0; i < objects_.size(); ++i) {
-        const auto& o = objects_[i];
-        if (L.ocr_skip.count(o.cls)) continue;
-        const bool text = o.cls == kText;
-        bool any = false;
-        for (size_t k : spread(o.boxes.size(), L.ocr_views)) {
-            const double* xy = o.boxes[k].data();
-            // A text box is already a tight line with its own margin.
-            if (!text && std::min(xy[2] - xy[0], xy[3] - xy[1]) < L.ocr_min_side) continue;
-            cv::Mat crop = object_crop(images[static_cast<size_t>(o.survivors[k])], xy, text ? 0.0 : L.ocr_pad);
-            if (crop.empty()) continue;
-            views.push_back({i, "object_" + std::to_string(o.object_id) + "_v" + std::to_string(k), std::move(crop)});
-            any = true;
-        }
-        n_objects += any;
+    if (L.ocr_skip.count(o.cls)) return views;
+    const bool text = o.cls == kText;
+    for (size_t k : spread(o.boxes.size(), L.ocr_views)) {
+        const double* xy = o.boxes[k].data();
+        // A text box is already a tight line with its own margin.
+        if (!text && std::min(xy[2] - xy[0], xy[3] - xy[1]) < L.ocr_min_side) continue;
+        cv::Mat crop = object_crop(images[static_cast<size_t>(o.survivors[k])], xy, text ? 0.0 : L.ocr_pad);
+        if (crop.empty()) continue;
+        views.push_back({object, "object_" + std::to_string(o.object_id) + "_v" + std::to_string(k), std::move(crop)});
     }
-    std::cout << "[aerial] ocr " << n_objects << " of " << objects_.size() << " object(s), " << views.size()
-              << " view(s)" << std::endl;
-    if (views.empty()) return;
-
-    auto take = [&](ObjectEntry& o, const std::vector<std::string>& words) {
-        o.reads.push_back(Read{words, florence_ != nullptr});
-    };
-    if (florence_) {
+    // EWORLD_KEEP_VIEWS=<dir>: the crops are kept there too, for reader benches.
+    static const char* keep = std::getenv("EWORLD_KEEP_VIEWS");
+    if (keep && *keep && !views.empty()) {
         std::error_code ec;
-        const fs::path dir = fs::temp_directory_path(ec) / ("eworld_objects_" + std::to_string(::getpid()));
-        fs::create_directories(dir, ec);
-        std::vector<std::string> paths;
-        for (const auto& v : views) {
-            const fs::path p = dir / (v.name + ".png");
-            cv::imwrite(p.string(), v.crop);
-            paths.push_back(p.string());
-        }
-        const auto texts = florence_->read_many(paths);
-        for (const auto& v : views) {
-            const auto it = texts.find(v.name);
-            if (it != texts.end()) take(objects_[v.object], figure_words(it->second));
-        }
-        fs::remove_all(dir, ec);
-    } else if (tess_) {
-        for (const auto& v : views) {
-            std::vector<std::string> words;
-            for (const auto& word : tess_->words(v.crop, 6)) {
-                const auto tok = ocr_token(word.text);
-                if (tok && keep_stencil(tok->substr(4))) words.push_back(tok->substr(4));
-            }
-            take(objects_[v.object], words);
-        }
+        fs::create_directories(keep, ec);
+        for (const auto& v : views) cv::imwrite((fs::path(keep) / (v.name + ".png")).string(), v.crop);
     }
+    return views;
 }
 
 void AerialDetector::attach_text(std::vector<std::vector<Box>>& frames) {
@@ -377,44 +520,86 @@ void AerialDetector::attach_text(std::vector<std::vector<Box>>& frames) {
 std::vector<FrameDetections> AerialDetector::detect(const std::vector<std::string>& image_paths) {
     records_.clear();
     objects_.clear();
+    timing_.clear();
+    for (auto& h : heads_) h.coco_s = h.world_s = h.scout_s = 0;
     std::vector<FrameDetections> out(image_paths.size());
     if (image_paths.empty()) return out;
     const auto& L = opt_.layer;
+    const size_t n = image_paths.size();
+    Stopwatch sw_total(timing_["total"]);
 
-    // 1. Object layer on every survivor, scene text included.
-    std::vector<cv::Mat> images;
-    std::vector<std::vector<Box>> frames(image_paths.size());
-    try {
-        for (const auto& p : image_paths) images.push_back(cv::imread(p, cv::IMREAD_COLOR));
-        for (size_t i = 0; i < images.size(); ++i) {
-            frames[i] = object_layer(images[i]);
-            for (auto& t : text_boxes(images[i])) frames[i].push_back(std::move(t));
+    // 1. Object layer on every survivor, scene text included: the workers
+    //    take frames in order, each delivering its boxes through a promise
+    //    the tracker below waits on. A worker that throws fails the frame
+    //    (detector contract: detect() does not throw).
+    std::vector<cv::Mat> images(n);
+    std::vector<std::vector<Box>> frames(n);
+    std::vector<std::promise<std::string>> ready(n);   // "" ok, else the error
+    std::vector<std::future<std::string>> done;
+    for (auto& p : ready) done.push_back(p.get_future());
+    std::atomic<size_t> next{0};
+    const int cores = std::max(1u, std::thread::hardware_concurrency());
+    const int saved_threads = cv::getNumThreads();
+    cv::setNumThreads(std::max(1, cores / static_cast<int>(heads_.size())));
+    double layer_s = 0;
+    std::vector<std::thread> pool;
+    const double t_layer = now_s();
+    for (auto& h : heads_)
+        pool.emplace_back([&, hp = &h] {
+            for (size_t i = next++; i < n; i = next++) {
+                std::string err;
+                try {
+                    images[i] = cv::imread(image_paths[i], cv::IMREAD_COLOR);
+                    frames[i] = object_layer(*hp, images[i]);
+                    for (auto& t : text_boxes(*hp, images[i])) frames[i].push_back(std::move(t));
+                } catch (const std::exception& e) {
+                    err = e.what();
+                }
+                ready[i].set_value(err);
+            }
+        });
+
+    // 3 (started first, fed by 2): the reader takes each object the moment
+    //    its track closes.
+    std::unique_ptr<Reader> reader;
+    if (florence_ || tess_) reader = std::make_unique<Reader>(florence_.get(), tess_.get(), L.ocr_batch);
+    auto close = [&](size_t entry) {
+        vote(objects_[entry]);
+        if (reader) {
+            auto views = views_of(entry, images);
+            if (!views.empty()) reader->submit(std::move(views));
         }
-    } catch (const std::exception& e) {   // detector contract: do not throw
-        std::cerr << "[aerial] object layer failed: " << e.what() << "\n";
-        records_.assign(image_paths.size(), FrameRecord{});
-        return out;
-    }
+    };
 
-    // 2. Dedup across survivors: greedy IoU match against objects seen in the
-    //    last max_gap + 1 frames. Labels need only share a group (heads swap
-    //    labels inside one: truck/tank/boat), and the vote below names the
-    //    object. The crops must look alike, or a box would follow the frame
-    //    across a cut into a different shot.
+    // 2. Dedup across survivors, in frame order as the layer delivers them:
+    //    greedy IoU match against objects seen in the last max_gap + 1
+    //    frames. Labels need only share a group (heads swap labels inside
+    //    one: truck/tank/boat), and the vote names the object. The crops
+    //    must look alike, or a box would follow the frame across a cut into
+    //    a different shot.
     struct Live { size_t entry; int last; double xyxy[4]; std::string label; cv::Mat hist; };
     std::vector<Live> live;
-    for (int i = 0; i < static_cast<int>(frames.size()); ++i) {
+    double track_s = 0;
+    std::string failure;
+    for (int i = 0; i < static_cast<int>(n); ++i) {
+        const std::string err = done[static_cast<size_t>(i)].get();
+        if (!err.empty() && failure.empty()) failure = err;
+        if (!failure.empty()) continue;
+        const double t0 = now_s();
+        for (auto& l : live)
+            if (i - l.last > L.track_max_gap + 1) close(l.entry);
         live.erase(std::remove_if(live.begin(), live.end(),
                                   [&](const Live& l) { return i - l.last > L.track_max_gap + 1; }),
                    live.end());
         std::vector<cv::Mat> hists;
-        for (const auto& b : frames[i]) hists.push_back(appearance(images[static_cast<size_t>(i)], b.xyxy));
+        for (const auto& b : frames[static_cast<size_t>(i)]) hists.push_back(appearance(images[static_cast<size_t>(i)], b.xyxy));
         struct Pair { double v; size_t box; size_t live; };
         std::vector<Pair> pairs;
-        for (size_t b = 0; b < frames[i].size(); ++b)
+        auto& fr = frames[static_cast<size_t>(i)];
+        for (size_t b = 0; b < fr.size(); ++b)
             for (size_t l = 0; l < live.size(); ++l) {
-                if (!L.same_group(frames[i][b].detected, live[l].label)) continue;
-                const double v = iou(frames[i][b].xyxy, live[l].xyxy);
+                if (!L.same_group(fr[b].detected, live[l].label)) continue;
+                const double v = iou(fr[b].xyxy, live[l].xyxy);
                 if (v < L.track_iou) continue;
                 if (hists[b].empty() || live[l].hist.empty() ||
                     cv::compareHist(hists[b], live[l].hist, cv::HISTCMP_CORREL) < L.track_min_appearance)
@@ -422,7 +607,7 @@ std::vector<FrameDetections> AerialDetector::detect(const std::vector<std::strin
                 pairs.push_back({v, b, l});
             }
         std::stable_sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) { return a.v > b.v; });
-        std::vector<bool> box_done(frames[i].size()), live_done(live.size());
+        std::vector<bool> box_done(fr.size()), live_done(live.size());
         auto observe = [&](ObjectEntry& o, const Box& b) {
             o.survivors.push_back(i);
             o.boxes.push_back({b.xyxy[0], b.xyxy[1], b.xyxy[2], b.xyxy[3]});
@@ -439,7 +624,7 @@ std::vector<FrameDetections> AerialDetector::detect(const std::vector<std::strin
             if (box_done[p.box] || live_done[p.live]) continue;
             box_done[p.box] = live_done[p.live] = true;
             auto& lv = live[p.live];
-            Box& b = frames[i][p.box];
+            Box& b = fr[p.box];
             b.object_id = objects_[lv.entry].object_id;
             observe(objects_[lv.entry], b);
             lv.last = i;
@@ -447,34 +632,66 @@ std::vector<FrameDetections> AerialDetector::detect(const std::vector<std::strin
             lv.label = b.detected;
             lv.hist = hists[p.box];
         }
-        for (size_t b = 0; b < frames[i].size(); ++b) {
+        for (size_t b = 0; b < fr.size(); ++b) {
             if (box_done[b]) continue;
             ObjectEntry o;
             o.object_id = next_object_id_++;
-            observe(o, frames[i][b]);
-            frames[i][b].object_id = o.object_id;
+            observe(o, fr[b]);
+            fr[b].object_id = o.object_id;
             objects_.push_back(o);
-            Live lv{objects_.size() - 1, i, {}, frames[i][b].detected, hists[b]};
-            std::copy(frames[i][b].xyxy, frames[i][b].xyxy + 4, lv.xyxy);
+            Live lv{objects_.size() - 1, i, {}, fr[b].detected, hists[b]};
+            std::copy(fr[b].xyxy, fr[b].xyxy + 4, lv.xyxy);
             live.push_back(lv);
         }
+        track_s += now_s() - t0;
     }
-    for (auto& o : objects_) {
-        const auto top = std::max_element(o.votes.begin(), o.votes.end(),
-                                          [](const auto& a, const auto& b) { return a.second < b.second; });
-        o.cls = top->first;
-        o.source = o.sources.at(top->first);
+    for (auto& t : pool) t.join();
+    layer_s = now_s() - t_layer;
+    cv::setNumThreads(saved_threads);
+    if (!failure.empty()) {
+        std::cerr << "[aerial] object layer failed: " << failure << "\n";
+        if (reader) reader->join();
+        records_.assign(n, FrameRecord{});
+        return out;
     }
-    std::cout << "[aerial] " << image_paths.size() << " survivor(s): "
+    {
+        const double t0 = now_s();
+        for (auto& l : live) close(l.entry);
+        live.clear();
+        track_s += now_s() - t0;
+    }
+    timing_["layer"] = layer_s;
+    timing_["track"] = track_s;
+    for (const auto& h : heads_) {
+        timing_["coco"] += h.coco_s;
+        timing_["world"] += h.world_s;
+        timing_["scout"] += h.scout_s;
+    }
+    std::cout << "[aerial] " << n << " survivor(s): "
               << std::accumulate(frames.begin(), frames.end(), size_t{0},
                                  [](size_t s, const std::vector<Box>& f) { return s + f.size(); })
               << " box(es) -> " << objects_.size() << " object(s)" << std::endl;
 
-    // 3. Read each object on a few views; text goes to the object it is on.
-    if (florence_ || tess_) read_objects(images);
-    attach_text(frames);
+    // 3. The last batch; then every read lands on its object.
+    if (reader) {
+        const double t0 = now_s();
+        reader->join();
+        timing_["read_wait"] = now_s() - t0;   // the tail the layer did not cover
+        timing_["read"] = reader->busy_s();
+        for (auto& [object, reads] : reader->reads())
+            objects_[object].reads.insert(objects_[object].reads.end(), reads.begin(), reads.end());
+        size_t n_objects = 0;
+        for (const auto& [object, reads] : reader->reads()) n_objects += !reads.empty();
+        std::cout << "[aerial] ocr " << n_objects << " of " << objects_.size() << " object(s), "
+                  << reader->views_read() << " view(s) in " << reader->batches() << " batch(es)" << std::endl;
+    }
+    {
+        Stopwatch sw(timing_["attach"]);
+        attach_text(frames);
+    }
 
     // 4. Every box looks its object up in the index; tags follow.
+    Stopwatch sw_index(timing_["index"]);
     std::map<long, const ObjectEntry*> index;
     for (const auto& o : objects_) index[o.object_id] = &o;
     for (size_t i = 0; i < frames.size(); ++i) {
@@ -505,6 +722,15 @@ std::vector<FrameDetections> AerialDetector::detect(const std::vector<std::strin
         }
         records_.push_back(FrameRecord{std::move(frames[i]), scene});
     }
+    sw_index.stop();
+    sw_total.stop();
+    std::string line = "[aerial] detect seconds:";
+    for (const auto& [k, v] : timing_) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, " %s=%.1f", k.c_str(), v);
+        line += buf;
+    }
+    std::cout << line << std::endl;
     return out;
 }
 

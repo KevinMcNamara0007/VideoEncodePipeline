@@ -7,22 +7,27 @@
 // ------------------------------------------------------------------------
 #pragma once
 /// @file aerial_detector.hpp
-/// Objects first, then text, as one ehc::media::FrameDetector.
+/// Objects first, then text, as one ehc::media::FrameDetector, in three
+/// concurrent stages:
 ///
-///   1. Object layer: YOLOv8 (COCO, filtered to classes that occur in aerial
-///      footage) and YOLO-World (prompts for what COCO has no name for),
-///      merged class-agnostically: overlapping boxes are one object, the
-///      more confident label wins. Scene text is a class too: Tesseract
-///      locates text lines ("text" boxes); it does not read them.
-///   2. Dedup: an object in the next kept frame is the same object when its
-///      box overlaps (IoU), whatever the heads called it, across short gaps.
-///      Each object gets an object_id and one class: the confidence-weighted
-///      vote over its frames.
-///   3. OCR: each object is read on a few crops spread over its frames
-///      (Florence-2 through the HaloCore door; Tesseract when Florence is
-///      off) and the words merged. Text written on another object (AMMO on
-///      a truck) is that object's text; a text object read as empty is
-///      dropped.
+///   1. Object layer (a pool of workers, one frame each): YOLOv8 (COCO,
+///      filtered to classes that occur in aerial footage) and YOLO-World
+///      (prompts for what COCO has no name for), merged class-agnostically:
+///      overlapping boxes are one object, the more confident label wins.
+///      Scene text is a class too: Tesseract locates text lines ("text"
+///      boxes); it does not read them.
+///   2. Dedup (the calling thread, frames in order): an object in the next
+///      kept frame is the same object when its box overlaps (IoU), whatever
+///      the heads called it, across short gaps. Each object gets an
+///      object_id and one class: the confidence-weighted vote over its
+///      frames. An object not seen for max_gap + 1 frames is closed and
+///      handed to the reader at once, while the layer is still on later
+///      frames.
+///   3. OCR (one reader thread): each closed object is read on a few crops
+///      spread over its frames (Florence-2 through the HaloCore door, in
+///      batches; Tesseract when Florence is off) and the words merged. Text
+///      written on another object (AMMO on a truck) is that object's text;
+///      a text object read as empty is dropped.
 ///   4. Index: objects() is the lookup table (object_id -> class, text,
 ///      frames). Each frame's boxes and ocr: tags come from it.
 ///
@@ -85,6 +90,7 @@ struct ObjectLayerConfig {
     int    ocr_min_side{48};
     double ocr_pad{0.1};
     int    ocr_views{3};
+    int    ocr_batch{32};                     // views per door call
     std::set<std::string> ocr_skip;
     bool   text_enabled{true};
     int    text_psm{11};
@@ -101,29 +107,50 @@ struct DetectorOptions {
     ObjectLayerConfig layer;
     int         imgsz{640};
     std::string ocr{"florence"};   // florence | tesseract | none
+    int         workers{0};        // object-layer threads; 0 = pick from the core count
 };
 
 class AerialDetector final : public ehc::media::FrameDetector {
 public:
     explicit AerialDetector(DetectorOptions opt);
+    ~AerialDetector() override;
     std::vector<ehc::media::FrameDetections> detect(const std::vector<std::string>& image_paths) override;
     std::string name() const override { return "aerial_objects_ocr"; }
     const std::vector<FrameRecord>& records() const { return records_; }
     const std::vector<ObjectEntry>& objects() const { return objects_; }
+    /// Wall seconds of the last detect(): total, layer (stage 1, all
+    /// workers), track, read (the reader thread's busy time), attach, index;
+    /// and the workers' summed coco / world / scout seconds.
+    const std::map<std::string, double>& timing() const { return timing_; }
+    int workers() const { return static_cast<int>(heads_.size()); }
 
 private:
-    std::vector<Box> object_layer(const cv::Mat& bgr);
-    std::vector<Box> text_boxes(const cv::Mat& bgr);
-    void read_objects(const std::vector<cv::Mat>& images);
+    /// One worker's models: a cv::dnn::Net and a TessBaseAPI serve one thread.
+    struct Heads {
+        std::unique_ptr<YoloHead>  coco, world;
+        std::unique_ptr<Tesseract> scout;   // locates scene text for the object layer
+        double coco_s{0}, world_s{0}, scout_s{0};
+    };
+    /// An object's crop to read: the reader's unit of work.
+    struct View {
+        size_t      object;
+        std::string name;
+        cv::Mat     crop;
+    };
+    class Reader;
+
+    std::vector<Box> object_layer(Heads& h, const cv::Mat& bgr) const;
+    std::vector<Box> text_boxes(Heads& h, const cv::Mat& bgr) const;
+    std::vector<View> views_of(size_t object, const std::vector<cv::Mat>& images) const;
     void attach_text(std::vector<std::vector<Box>>& frames);
 
     DetectorOptions                opt_;
-    std::unique_ptr<YoloHead>      coco_, world_;
+    std::vector<Heads>             heads_;      // one per worker
     std::unique_ptr<HaloFlorence>  florence_;
-    std::unique_ptr<Tesseract>     tess_;    // OCR when --ocr tesseract
-    std::unique_ptr<Tesseract>     scout_;   // locates scene text for the object layer
+    std::unique_ptr<Tesseract>     tess_;       // OCR when --ocr tesseract
     std::vector<FrameRecord>       records_;
     std::vector<ObjectEntry>       objects_;
+    std::map<std::string, double>  timing_;
     long                           next_object_id_{0};   // unique across videos
 };
 

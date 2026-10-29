@@ -19,12 +19,19 @@ survivor keyframes, the moments the encoder kept.
 ## Objects first, then text
 
 ```
-survivor frames ──► object layer ──► dedup ──► OCR, once per object ──► index
-                   YOLOv8x (COCO)    same object      Florence-2           objects.jsonl
-                 + YOLO-World-x      across frames    (HaloCore door)      ▲
-                   merged            = object_id                           │
-frames.jsonl tags, overlay.jsonl boxes ◄── each box looks its object up ───┘
+survivor frames ──► object layer ──► dedup ──► OCR, per closed object ──► index
+                   YOLOv8x (COCO)    same object      Florence-2             objects.jsonl
+                 + YOLO-World-x      across frames    (HaloCore door)        ▲
+                   merged            = object_id      on the reader thread   │
+                   2 worker threads  calling thread                          │
+frames.jsonl tags, overlay.jsonl boxes ◄── each box looks its object up ─────┘
 ```
+
+The three stages run at once: the workers take frames in order, the
+tracker consumes them as they land, and an object whose track has closed
+(not seen for `track.max_gap + 1` frames) goes to the reader immediately,
+while the layer is still on later frames. The reader batches `ocr.batch`
+views per door call.
 
 1. **Object layer.** YOLOv8x (COCO) names people and vehicles. Its other
    classes are dropped (`coco.keep`): toilet, suitcase, bench, parking meter
@@ -73,8 +80,8 @@ All four steps are in `config/object_layer.json`, not in code.
 | `StreamingVideoEncoder` | pHash dedup, vision features, VSA dedup, then the detector once per video at `finalize()`. |
 | YOLOv8x (OpenCV DNN) | COCO people and vehicles. `models/yolov8x.onnx`. Post-processing is Ultralytics predict (letterbox, conf, per-class NMS 0.7); boxes match Ultralytics exactly. |
 | YOLOv8x-worldv2 (OpenCV DNN) | The config's prompts, baked into `models/yolov8x-worldv2-aerial.onnx`. |
-| HaloCore Florence-2 | `libhalocore_door` (opened at run time from `/opt/mpl/lib`, or `$HALOCORE_DOOR_LIB`) runs Microsoft Florence-2 (`/opt/mpl/models/florence-2-base-onnx`) on the object crops, one door call per video. |
-| Tesseract (libtesseract) | The OCR when `--ocr tesseract`: one read per object crop. |
+| HaloCore Florence-2 | `libhalocore_door` (opened at run time from `/opt/mpl/lib`, or `$HALOCORE_DOOR_LIB`) runs Microsoft Florence-2 (`/opt/mpl/models/florence-2-base-onnx`) on the object crops, one door call per `ocr.batch` views, on the reader thread. The encode sets `HALOCORE_FIGURES_TASKS=ocr` (the door's object labels and caption are not used) and `HALOCORE_FIGURES_THREADS` to half the cores, unless set already. |
+| Tesseract (libtesseract) | Locates scene text on every frame (the scout, inside each worker). The OCR itself when `--ocr tesseract`: one read per object crop. |
 | OpenCV | Reads the survivor PNGs, cuts the crops, draws the preview. |
 
 A YOLO-World `.onnx` answers the prompt list it was exported with, and the
@@ -152,6 +159,10 @@ build/aerial_encode input out --fps 2 --frame 640x640 --ocr florence
 `--objects` picks another object-layer config; `--model`, `--world-model`
 and `--conf` override single entries of it. `--ocr tesseract` reads the
 crops with Tesseract instead of Florence; `--ocr none` skips OCR.
+`--threads N` is the number of object-layer workers (default 2 on 8+
+cores): each owns its two YOLO heads and a Tesseract, and a YOLO forward
+already spreads over OpenCV's thread pool, so more than 2 is slower
+(section "Where the time goes").
 
 `--fps 2` is the demo rate. A locked-off aerial then keeps a handful of
 survivor frames instead of every frame. `--frame 640x640` is the YOLO and
@@ -207,6 +218,62 @@ Tags fused into the vector for that frame include `truck`, `ocr:B127`, and
 `scene:ground`. The per-frame budget is `max_items_per_frame` (40) minus the
 vision features. Lowest confidence is dropped first. OCR tokens are capped
 at 8 per frame.
+
+## Where the time goes
+
+Measured on `input/drone_raw.mp4` (338 frames at 2 fps, 326 survivors, 198
+objects, 192 OCR views), 16-core Apple silicon, OpenCV DNN on the CPU. The
+numbers are the `detect seconds` line the encode prints (also in
+`encode_log.jsonl` as `detect_seconds`).
+
+**Before the stages ran concurrently** (one thread, OCR after the layer,
+the door describing every crop three ways): 355 s wall.
+
+| Stage | seconds |
+|---|---|
+| YOLOv8x COCO, 326 forwards | 71.6 |
+| YOLO-World-x, 326 forwards | 80.8 |
+| Tesseract scout, 326 frames | 12.9 |
+| Florence door, 192 views (object labels + OCR + caption, 4 threads) | 174.8 |
+
+So the door was half the time, not 99 %, and most of its half was the
+caption and object labels the encode never reads.
+
+**The same 192 crops through each reader** (`build/ocr_bench`; the crops
+come from `EWORLD_KEEP_VIEWS=<dir>`):
+
+| Reader | s / view | views with text | scene words found (of 15) | junk words |
+|---|---|---|---|---|
+| Tesseract psm 7 | 0.01 | 17 | 5 | 2 |
+| Tesseract psm 6 | 0.02 | 30 | 6 | 10 |
+| Tesseract psm 11 | 0.01 | 29 | 8 | 5 |
+| Tesseract psm 7, crop ×2 | 0.03 | 19 | 6 | 2 |
+| door, all three generations, 4 threads | 0.91 | 117 | 15 | 31 |
+| door, `HALOCORE_FIGURES_TASKS=ocr`, 4 threads | 0.58 | 117 | 15 | 31 |
+| door, OCR only, 8 threads | 0.45 | 117 | 15 | 31 |
+
+The OCR-only door returns the same words as the full pass, in half the
+time. Tesseract is 50–100× cheaper and reads the printed signs (NORTH GATE,
+FUEL, 762, the runway 27) but none of the stencils on vehicles: B127 comes
+out as B27 / B12 / 127, T441 as 144, AMMO as ANNO, and C330, A22, P19,
+AF218, MK82, RANGE do not come out at all. Tesseract is a document reader:
+it binarises and expects lines of print on a flat page. A stencil on a
+curved, lit, foreshortened tailgate in a drone shot is scene text, which
+is what Florence-2 was trained on. End to end, `--ocr tesseract` finishes
+in 143 s and finds 3 of the 15 words exactly; Florence finds 13 (MK82 is
+read on one view only, and the runway 27 as 127).
+
+**Object-layer workers** (`--threads`, `--ocr none`): 1 worker 153 s,
+2 workers 126 s, 4 workers 136 s. A forward already spreads over OpenCV's
+pool; the second frame in flight fills the gaps, a third and fourth fight
+for cores.
+
+**After** (2 workers, the reader on its own thread with
+`HALOCORE_FIGURES_TASKS=ocr`, 4 threads, batches of 32): **188 s wall**,
+identical `objects.jsonl`. The layer took 154 s (slower than its solo 126 s:
+the reader's threads share the cores), the reads 120 s of which all but
+the last batch (20 s) ran under the layer. The encode is now YOLO-bound;
+the next lever is a faster head, not the OCR.
 
 ## 3. Query a label
 

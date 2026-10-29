@@ -60,7 +60,9 @@ const char* kUsage =
     "  --world-model PATH   override the config's YOLO-World head .onnx\n"
     "  --conf C             override the config's COCO confidence\n"
     "  --ocr MODE           florence (default; HaloCore door) | tesseract | none.\n"
-    "                       One read per deduplicated object, on its largest crop.\n";
+    "                       A few reads per deduplicated object, spread over its frames,\n"
+    "                       on a reader thread while the object layer runs on.\n"
+    "  --threads N          object-layer workers, one frame each (default 2 on 8+ cores, else 1)\n";
 
 double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -201,6 +203,7 @@ struct Args {
     std::string model, world_model;
     float conf = -1.0f;
     std::string ocr = "florence";
+    int threads = 0;
 };
 
 Args parse(int argc, char** argv) {
@@ -221,6 +224,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--model") a.model = val();
         else if (k == "--world-model") a.world_model = val();
         else if (k == "--conf") a.conf = std::stof(val());
+        else if (k == "--threads") a.threads = std::stoi(val());
         else if (k == "--ocr") {
             a.ocr = val();
             if (a.ocr != "florence" && a.ocr != "tesseract" && a.ocr != "none") {
@@ -292,6 +296,7 @@ int main(int argc, char** argv) {
     if (args.conf >= 0) opt.layer.coco_conf = args.conf;
     opt.imgsz = std::max(frame_w, frame_h);
     opt.ocr = args.ocr;
+    opt.workers = args.threads;
     for (const auto& m : {opt.layer.coco_model, opt.layer.world_model})
         if (!m.empty() && !fs::is_regular_file(m)) die("model not found: " + m + " (run.sh exports it)");
     std::cout << "[aerial] objects: " << fs::path(opt.layer.coco_model).filename().string()
@@ -429,7 +434,7 @@ int main(int argc, char** argv) {
                         {"input_frames", n_input}, {"frames_seen", st.frames_seen},
                         {"dropped_phash", st.dropped_phash}, {"dropped_vsa", st.dropped_vsa},
                         {"dropped_stage2", st.dropped_stage2}, {"survivors_kept", encoded.size()},
-                        {"objects", objects.size()},
+                        {"objects", objects.size()}, {"detect_seconds", detector->timing()},
                         {"detector_tokens_emitted", st.detector_tokens_emitted},
                         {"detector_tokens_dropped", st.detector_tokens_dropped}}.dump()
                 << "\n";

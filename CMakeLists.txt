@@ -73,3 +73,6 @@ add_executable(yolo_dump tests/yolo_dump.cpp)
 target_link_libraries(yolo_dump PRIVATE eworld_core)
 add_executable(ocr_dump tests/ocr_dump.cpp)
 target_link_libraries(ocr_dump PRIVATE eworld_core)
+# The reader bench: the same crops through Tesseract or the door, timed.
+add_executable(ocr_bench tests/ocr_bench.cpp)
+target_link_libraries(ocr_bench PRIVATE eworld_core)

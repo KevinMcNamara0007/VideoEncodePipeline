@@ -2,8 +2,10 @@
 
 Entangled world. This folder is the runnable demo for the EHC aerial encode:
 objects from YOLOv8x and YOLO-World, deduplicated across frames, each
-object's stencil read once by Florence-2, and the keyframe vectors in one
-index. The object layer is `config/object_layer.json`.
+object's stencil read by Florence-2 on a few of its frames, and the keyframe
+vectors in one index. The object layer is `config/object_layer.json`. The
+object layer (worker threads), the tracker and the OCR reader run as
+concurrent stages; the reader takes an object the moment its track closes.
 
 EHC stays the library. The recipe pipeline lives in this folder and is
 native C++: `src/aerial_encode.cpp` (the encode driver) and
