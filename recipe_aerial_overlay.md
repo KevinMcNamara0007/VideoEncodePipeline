@@ -306,10 +306,24 @@ filter the encoder sampled it with (`config.json` `target_fps`), at source
 size: survivor `frame_idx` N is frame N of that stream, the exact frame the
 boxes were found on. Boxes are scaled onto it and labelled
 `class #object_id  TEXT  confidence`: the same `#id` on two frames is one
-object. Survivors play at 2 fps (`--hold 0.5`). A class keeps its colour
-from run to run. On `drone_raw.mp4` (326 survivors) this takes 8 s; the
-earlier one-seek-per-survivor version decoded from the start of the file
-for every survivor and took 3 min 52 s.
+object. A class keeps its colour from run to run. On `drone_raw.mp4` (326
+survivors) this takes 8 s; the earlier one-seek-per-survivor version
+decoded from the start of the file for every survivor and took 3 min 52 s.
+
+The preview runs on the **source clock**: each survivor stays up until the
+next survivor's timestamp (a frame the encoder dropped as a near-duplicate
+leaves its stand-in on screen for its slot), the last one for `--hold`
+seconds. Preview second `t` is source millisecond `1000 t`, so a fact's
+`point_in_time` seeks the preview with no lookup; `drone_raw.mp4` gives a
+169 s preview of 326 frames.
+
+Beside the preview the step writes `preview.index.json`, the lookup the
+appliance's page reads to play the frames a fact names: `frames` (every
+survivor in preview order: `frame_idx`, `ts_ms`, `t` and `end` on the
+preview clock, `scene`, and its boxes with `object_id`, `class`, `ocr`),
+`objects` (objects.jsonl, each with the `frames` it was seen on) and
+`videos` (source, sizes, the preview span of each). Section 6 puts both
+beside the store.
 
 ## 5. Ingest through the HaloCore front door
 
@@ -348,6 +362,51 @@ parking meter), the old separate "ocr pass" film, frames with no box
 C330) go through HaloCore's record lane; that needs HaloCore with the
 record-lane hop fix (branch `cpp`), or "What is B127 shown in?" answers
 `B127`.
+
+## 6. Publish to the appliance: the pool, its sidecars, five-frame playback
+
+```bash
+./publish.sh eworld            # --replace to re-encode an existing pool of that name
+```
+
+`publish.sh` is the clip's way into the running appliance (`/opt/mpl`,
+or `--home`). It does four things, in this order, and prints each:
+
+1. **Ingest through the front door.** `POST /v1/ingest {source:
+   out/triples.jsonl, store: eworld}` on the appliance is HaloCore's
+   `ehc::ops::ingest`, the one call `halocore ingest` makes. It encodes the
+   triples into the native store `<home>/data/stores/eworld/` (the
+   appliance's ingest root), emits the serving relics as every ingest does
+   (`subjects.tsv`, `surfaces.ehmap`, `sim_subjects.ehsim`,
+   `sim_relations.ehsim`, `relation_surfaces.json`, `subj_index.bin`, the
+   relation learner's files) and mounts the store as the pool `eworld`.
+   The appliance's `start.sh` walks the ingest root at boot, so the pool
+   comes back after a restart like every store under `MOE/`.
+2. **The preview and its lookups beside the shards.** `<store>/media/`
+   gets `preview.mp4`, `preview.index.json`, `frames.lsh` (the keyframe
+   vectors), `objects.jsonl` (the object index), `overlay.jsonl`,
+   `frames.jsonl`, `videos.jsonl`, `config.json`, `encode_summary.json`
+   and the `triples.jsonl` that was ingested. The appliance serves them at
+   `GET /v1/pools/eworld/files/media/<name>` (a mounted store's own
+   directory only; media, JSON and text only; HTTP Range for the video),
+   the same way a document store's `figures/` sit beside its shards.
+3. **Relics and the mount, checked.** `halocore relics --index <store>
+   --contract` is run and the relic files listed with their sizes; the
+   registry (`GET /v1/lakes`) is read back for the pool; the index and a
+   Range of the video are fetched through the appliance.
+4. **One question** through the query door (`--ask`, default "What is the
+   story setting of frame 26?").
+
+**Five-frame playback on the page.** When an answer's facts name a frame
+(`frame 26` as subject or object, or among the objects also seen) of a
+store that carries `media/preview.index.json`, the answer card shows that
+store's preview and plays five sampled frames from the one named: the
+frame itself and the four survivors after it, each for its own slot on the
+source clock, then pauses. Chips switch between the frames an answer
+names; the strip under the video lists the five frames (time, scene,
+objects and words) and clicking one seeks to it. This is
+`frontend/frame_playback.js` (L3M `halocore_v1`), one GET per store per
+page; a store without the sidecar changes nothing on the page.
 
 ## OpenCV as its own detector
 

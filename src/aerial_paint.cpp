@@ -8,16 +8,25 @@
 /// aerial_paint -- paint overlay.jsonl back onto the source frames and write
 /// a preview mp4.
 ///
-/// The preview is the survivor keyframes, one after another, each held for
-/// --hold seconds (0.5 = 2 fps). Boxes are in encoder-frame pixels and are
-/// scaled by src_w/frame_w and src_h/frame_h, matching ffmpeg scale=W:H
-/// (stretched, not letterboxed).
+/// The preview is the survivor keyframes, one after another, on the SOURCE
+/// clock: each survivor stays on screen until the next survivor's timestamp
+/// (a dropped near-duplicate leaves its stand-in up for its slot), the last
+/// one for --hold seconds. Preview second t is source millisecond 1000 t, so
+/// a fact's `point_in_time` seeks the preview without a lookup. Boxes are in
+/// encoder-frame pixels and are scaled by src_w/frame_w and src_h/frame_h,
+/// matching ffmpeg scale=W:H (stretched, not letterboxed).
 ///
 /// Each source is decoded once, through the same FFmpegFramePipe and fps
 /// filter the encoder sampled it with (config.json target_fps), at source
 /// size: survivor frame_idx N is frame N of that stream, exactly the frame
 /// the boxes were found on. (One seek per survivor decoded from the start
 /// each time: 326 survivors took 3 min 52 s. One pass takes seconds.)
+///
+/// Beside the preview it writes `<preview>.index.json`, the lookup the
+/// appliance's page reads to play the frames a fact names: every survivor
+/// in preview order with its source time, preview time, scene and boxes
+/// (object id, class, words), and the deduplicated objects (objects.jsonl)
+/// with the frames each one was seen on.
 ///
 ///     aerial_paint <out_dir> <preview.mp4> [--hold 0.5]
 #include "ehc/media/ffmpeg_pipe.hpp"
@@ -120,6 +129,65 @@ void draw_row(cv::Mat& img, const json& row) {
     std::exit(1);
 }
 
+/// One survivor of the preview: its row, and where it sits on the preview clock.
+struct Cue {
+    size_t row;          // index into rows
+    double t;            // preview seconds this survivor appears
+    double duration;     // seconds it stays up
+};
+
+/// The lookup beside the preview (see the file comment). `objects` is
+/// objects.jsonl when the encode wrote one.
+json preview_index(const fs::path& out_dir, const fs::path& preview, double fps, const std::vector<json>& rows,
+                   const std::vector<Cue>& cues) {
+    json videos = json::array(), frames = json::array();
+    std::map<int, size_t> video_slot;
+    for (const auto& c : cues) {
+        const json& r = rows[c.row];
+        const int vid = r.value("video_id", 0);
+        if (!video_slot.count(vid)) {
+            video_slot[vid] = videos.size();
+            videos.push_back({{"video_id", vid}, {"source_path", r.value("source_path", "")},
+                              {"src_w", r.value("src_w", 0)}, {"src_h", r.value("src_h", 0)},
+                              {"frame_w", r.value("frame_w", 0)}, {"frame_h", r.value("frame_h", 0)},
+                              {"first_t", c.t}, {"last_t", c.t + c.duration}});
+        } else {
+            videos[video_slot[vid]]["last_t"] = c.t + c.duration;
+        }
+        json boxes = json::array();
+        for (const auto& b : r.value("boxes", json::array())) {
+            if (b.contains("overlay") && b["overlay"].is_boolean() && !b["overlay"].get<bool>()) continue;
+            boxes.push_back({{"object_id", b.value("object_id", -1)}, {"class", b.value("class", "")},
+                             {"ocr", b.value("ocr", json::array())}, {"confidence", b.value("confidence", 0.0)},
+                             {"xyxy", b.value("xyxy", json::array())}});
+        }
+        frames.push_back({{"i", frames.size()}, {"video_id", vid}, {"frame_idx", r.value("frame_idx", 0)},
+                          {"ts_ms", r.value("ts_ms", 0.0)}, {"t", c.t}, {"end", c.t + c.duration},
+                          {"scene", r.value("scene", "")}, {"boxes", boxes}});
+    }
+    json objects = json::array();
+    if (std::ifstream obj(out_dir / "objects.jsonl"); obj) {
+        for (std::string line; std::getline(obj, line);) {
+            if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+            const json o = json::parse(line);
+            json seen = json::array();
+            for (const auto& f : o.value("frames", json::array())) seen.push_back(f.value("frame_idx", 0));
+            objects.push_back({{"object_id", o.value("object_id", -1)}, {"video_id", o.value("video_id", 0)},
+                               {"class", o.value("class", "")}, {"source", o.value("source", "")},
+                               {"confidence", o.value("confidence", 0.0)}, {"ocr", o.value("ocr", json::array())},
+                               {"host_id", o.value("host_id", json())}, {"first_ts_ms", o.value("first_ts_ms", 0.0)},
+                               {"last_ts_ms", o.value("last_ts_ms", 0.0)}, {"frames", seen}});
+        }
+    }
+    return json{{"version", 1},
+                {"preview", preview.filename().string()},
+                {"clock", "source"},
+                {"sample_fps", fps},
+                {"videos", videos},
+                {"frames", frames},
+                {"objects", objects}};
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -129,7 +197,9 @@ int main(int argc, char** argv) {
         const std::string k = argv[i];
         if (k == "-h" || k == "--help") {
             std::cout << "usage: aerial_paint <out_dir> <preview.mp4> [--hold SECONDS]\n"
-                         "  --hold  seconds each survivor stays on screen (default 0.5)\n";
+                         "  Survivors play on the source clock (each until the next survivor's\n"
+                         "  timestamp); writes <preview>.index.json beside the preview.\n"
+                         "  --hold  seconds the LAST survivor of each source stays on screen (default 0.5)\n";
             return 0;
         }
         if (k == "--hold" && i + 1 < argc) hold = std::stod(argv[++i]);
@@ -195,16 +265,32 @@ int main(int argc, char** argv) {
                       << (ehc::util::Subprocess::status_failed(pipe.exit_status()) ? " (ffmpeg failed)" : "") << "\n";
     }
     if (n_painted == 0) die("no frames painted");
-    std::vector<fs::path> written;
-    for (const auto& p : painted)
-        if (!p.empty()) written.push_back(p);
+
+    // The preview clock: a survivor stays up until the next survivor of the
+    // same source (its own slot plus those of the near-duplicates it stands
+    // for); the last of a source, and a lone one, for --hold.
+    std::vector<Cue> cues;
+    double t = 0.0;
+    for (size_t i = 0; i < painted.size(); ++i) {
+        if (painted[i].empty()) continue;
+        size_t next = i + 1;
+        while (next < painted.size() && painted[next].empty()) ++next;
+        double d = hold;
+        if (next < painted.size() && rows[next].value("source_path", "") == rows[i].value("source_path", "")) {
+            const double gap = (rows[next].value("ts_ms", 0.0) - rows[i].value("ts_ms", 0.0)) / 1000.0;
+            if (gap > 0) d = gap;
+        }
+        cues.push_back({i, t, d});
+        t += d;
+    }
 
     // Concat resolves relative paths from the list file's directory.
     const fs::path lst = out_dir / "preview_frames.txt";
     {
         std::ofstream fh(lst);
-        for (const auto& p : written) fh << "file '" << fs::absolute(p).string() << "'\nduration " << hold << "\n";
-        fh << "file '" << fs::absolute(written.back()).string() << "'\n";
+        for (const auto& c : cues)
+            fh << "file '" << fs::absolute(painted[c.row]).string() << "'\nduration " << c.duration << "\n";
+        fh << "file '" << fs::absolute(painted[cues.back().row]).string() << "'\n";
     }
     if (preview.has_parent_path()) fs::create_directories(preview.parent_path());
     try {
@@ -214,6 +300,14 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         die(std::string("ffmpeg failed: ") + e.what());
     }
-    std::cout << "[paint] " << written.size() << " frames -> " << preview.string() << std::endl;
+    fs::path index = preview;
+    index.replace_extension(".index.json");
+    {
+        std::ofstream fh(index);
+        if (!fh) die("cannot write " + index.string());
+        fh << preview_index(out_dir, preview, fps, rows, cues).dump() << "\n";
+    }
+    std::cout << "[paint] " << cues.size() << " frames, " << t << " s -> " << preview.string() << "  index "
+              << index.string() << std::endl;
     return 0;
 }

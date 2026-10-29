@@ -26,6 +26,20 @@ heads to ONNX the first time, encodes `input/` into `out/`, and writes
 `output/preview.mp4`: the survivor keyframes with their boxes drawn, each
 labelled `class #object_id  TEXT`. `out/objects.jsonl` is the object index.
 
+Put the clip into the appliance:
+
+```bash
+./publish.sh eworld
+```
+
+That ingests `out/triples.jsonl` through the appliance's HaloCore front
+door (`POST /v1/ingest`) into the native store `/opt/mpl/data/stores/eworld`,
+mounted as the pool `eworld`, places `preview.mp4`, `preview.index.json`,
+`frames.lsh` and `objects.jsonl` beside its shards under `media/`, checks
+the relics and the mount, and asks one question. On the appliance page a
+fact that names a frame then plays five frames of the preview from that
+frame (recipe section 6).
+
 Build by hand:
 
 ```bash
