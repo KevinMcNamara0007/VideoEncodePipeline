@@ -306,7 +306,10 @@ filter the encoder sampled it with (`config.json` `target_fps`), at source
 size: survivor `frame_idx` N is frame N of that stream, the exact frame the
 boxes were found on. Boxes are scaled onto it and labelled
 `class #object_id  TEXT  confidence`: the same `#id` on two frames is one
-object. A class keeps its colour from run to run. On `drone_raw.mp4` (326
+object. A class keeps its colour from run to run. A box the encoder
+withheld from the lake (`fact: false`, section 5) is drawn grey, thin and
+labelled `withheld`, so the preview shows what the appliance was not told.
+On `drone_raw.mp4` (326
 survivors) this takes 8 s; the earlier one-seek-per-survivor version
 decoded from the start of the file for every survivor and took 3 min 52 s.
 
@@ -315,7 +318,10 @@ next survivor's timestamp (a frame the encoder dropped as a near-duplicate
 leaves its stand-in on screen for its slot), the last one for `--hold`
 seconds. Preview second `t` is source millisecond `1000 t`, so a fact's
 `point_in_time` seeks the preview with no lookup; `drone_raw.mp4` gives a
-169 s preview of 326 frames.
+169 s preview of 326 frames. The video's timestamps are in milliseconds
+(`-video_track_timescale 1000`): on ffmpeg's default 1/25 s track clock a
+half-second cue landed at 0.52 s, and a seek to "cue plus a little" sat on
+the frame boundary.
 
 Beside the preview the step writes `preview.index.json`, the lookup the
 appliance's page reads to play the frames a fact names: `frames` (every
@@ -351,6 +357,25 @@ forms for:
 | shown in, depicted in | `<class> depicted_by frame N`, `frame N depicts <class>` |
 | title / on-screen text of a frame, shown in for a plate | `frame N title W`, `frame N subtitle W`, `W depicted_by frame N`, `W subtitle frame N` |
 | an attribute of | `frame N facet_of no-box` |
+
+**Only a corroborated object becomes a fact.** The heads run low (COCO
+0.25, World 0.20) so that tracks stay continuous across frames, and the
+lake scores every triple of a subject alike, so without a gate the weakest
+detection in the clip is the first answer: "What is the tank shown in?"
+led with frame 102, a 0.26 "tank" box on the A14 truck, followed by a 0.24
+sliver at the top edge of frame 146, with the real tank (frames 151 to 175,
+0.50 to 0.76) behind them. The rule is the one `corroborate()` already
+applies to OCR words: an object is a fact when it was seen on
+`objects.min_frames` survivors (2), or once at or above
+`objects.min_confidence` (0.4), in `config/object_layer.json`. Measured on
+`drone_raw.mp4`: every false tank and humvee was one look under 0.30; the
+real objects a single look caught were 0.47 and up (a soldier in a cab, a
+distant truck), so 0.5 would have cost them. A withheld object stays in
+`objects.jsonl` and `overlay.jsonl` with `fact: false` (the preview paints
+it grey), and a frame whose only boxes were withheld is `facet_of no-box`.
+With the floor: 14 tank objects become 6 (five real, one 0.47 shot of a
+truck's underside), the three "humvee" objects go, 30 objects of 198 are
+withheld in all and the clip's triples go from 3,330 to 3,266.
 
 Measured on `input/drone_raw.mp4` (3,330 triples, 383 subjects, every
 relation surfaced): of the 75 questions, 57 answer with a fact that is in

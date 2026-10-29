@@ -102,8 +102,12 @@ void draw_row(cv::Mat& img, const json& row) {
         const int y0 = static_cast<int>(std::lround(xy[1].get<double>() * sy));
         const int x1 = static_cast<int>(std::lround(xy[2].get<double>() * sx));
         const int y1 = static_cast<int>(std::lround(xy[3].get<double>() * sy));
-        const cv::Scalar col = color_for(label);
-        cv::rectangle(img, {x0, y0}, {x1, y1}, col, 2);
+        // fact:false (the encoder withheld the object: one look under the
+        // floor) is drawn grey and thin, so the preview shows what the lake
+        // was not told.
+        const bool fact = !(b.contains("fact") && b["fact"].is_boolean() && !b["fact"].get<bool>());
+        const cv::Scalar col = fact ? color_for(label) : cv::Scalar{128, 128, 128};
+        cv::rectangle(img, {x0, y0}, {x1, y1}, col, fact ? 2 : 1);
         const json ocr = b.value("ocr", json::array());
         std::string text = label;
         if (label.rfind("ocr:", 0) == 0) text = label.substr(4);
@@ -120,7 +124,9 @@ void draw_row(cv::Mat& img, const json& row) {
             std::snprintf(c, sizeof c, "  %.2f", b["confidence"].get<double>());
             text += c;
         }
-        cv::putText(img, text, {x0, std::max(20, y0 - 8)}, cv::FONT_HERSHEY_SIMPLEX, 0.6, col, 2, cv::LINE_AA);
+        if (!fact) text += "  withheld";
+        cv::putText(img, text, {x0, std::max(20, y0 - 8)}, cv::FONT_HERSHEY_SIMPLEX, 0.6, col, fact ? 2 : 1,
+                    cv::LINE_AA);
     }
 }
 
@@ -159,7 +165,7 @@ json preview_index(const fs::path& out_dir, const fs::path& preview, double fps,
             if (b.contains("overlay") && b["overlay"].is_boolean() && !b["overlay"].get<bool>()) continue;
             boxes.push_back({{"object_id", b.value("object_id", -1)}, {"class", b.value("class", "")},
                              {"ocr", b.value("ocr", json::array())}, {"confidence", b.value("confidence", 0.0)},
-                             {"xyxy", b.value("xyxy", json::array())}});
+                             {"fact", b.value("fact", true)}, {"xyxy", b.value("xyxy", json::array())}});
         }
         frames.push_back({{"i", frames.size()}, {"video_id", vid}, {"frame_idx", r.value("frame_idx", 0)},
                           {"ts_ms", r.value("ts_ms", 0.0)}, {"t", c.t}, {"end", c.t + c.duration},
@@ -175,6 +181,7 @@ json preview_index(const fs::path& out_dir, const fs::path& preview, double fps,
             objects.push_back({{"object_id", o.value("object_id", -1)}, {"video_id", o.value("video_id", 0)},
                                {"class", o.value("class", "")}, {"source", o.value("source", "")},
                                {"confidence", o.value("confidence", 0.0)}, {"ocr", o.value("ocr", json::array())},
+                               {"fact", o.value("fact", true)},
                                {"host_id", o.value("host_id", json())}, {"first_ts_ms", o.value("first_ts_ms", 0.0)},
                                {"last_ts_ms", o.value("last_ts_ms", 0.0)}, {"frames", seen}});
         }
@@ -294,9 +301,19 @@ int main(int argc, char** argv) {
     }
     if (preview.has_parent_path()) fs::create_directories(preview.parent_path());
     try {
+        // Constant frame rate at the sample fps, millisecond timestamps. Every
+        // cue is a whole number of sample periods (survivors sit on the sample
+        // grid; a dropped frame's slot is one period), so CFR at that rate
+        // puts each cue exactly on its source time. The concat demuxer alone
+        // clocks images in 1/25 s and put a 0.5 s cue at 0.52.
+        char rate[32];
+        std::snprintf(rate, sizeof rate, "%.6g", fps);
         (void)ehc::util::Subprocess::capture({"ffmpeg", "-y", "-nostdin", "-loglevel", "error", "-f", "concat",
-                                              "-safe", "0", "-i", lst.string(), "-fps_mode", "vfr", "-pix_fmt",
-                                              "yuv420p", preview.string()});
+                                              "-safe", "0", "-i", lst.string(), "-r", rate, "-fps_mode", "cfr",
+                                              "-video_track_timescale", "1000", "-pix_fmt", "yuv420p",
+                                              // moov first: a page seeking over HTTP Range reads the index
+                                              // from the head of the file, not after a round trip to the tail.
+                                              "-movflags", "+faststart", preview.string()});
     } catch (const std::exception& e) {
         die(std::string("ffmpeg failed: ") + e.what());
     }

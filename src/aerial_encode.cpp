@@ -109,9 +109,12 @@ json video_meta(const std::string& src) {
                 {"src_w", src_w}, {"src_h", src_h}};
 }
 
-json box_json(const Box& b) {
+/// `fact`: whether the box's object is corroborated (ObjectLayerConfig::
+/// corroborated) and so emitted as triples. The paint draws fact:false grey.
+json box_json(const Box& b, bool fact) {
     return json{{"object_id", b.object_id}, {"class", b.cls}, {"detected", b.detected}, {"confidence", b.confidence},
-                {"xyxy", {b.xyxy[0], b.xyxy[1], b.xyxy[2], b.xyxy[3]}}, {"ocr", b.ocr}, {"source", b.source}};
+                {"xyxy", {b.xyxy[0], b.xyxy[1], b.xyxy[2], b.xyxy[3]}}, {"ocr", b.ocr}, {"source", b.source},
+                {"fact", fact}};
 }
 
 /// The clip as triples for the HaloCore ingest front door
@@ -123,10 +126,14 @@ json box_json(const Box& b) {
 /// forms for ("part of", "point in time", "shown in", "story setting",
 /// "on-screen text", "title", "also known as"). Every sampled frame is a
 /// subject: a frame the encoder dropped as a near-duplicate is
-/// said_to_be_the_same_as the survivor that stands for it.
+/// said_to_be_the_same_as the survivor that stands for it. Only a box
+/// whose object is in `facts` (corroborated: seen on enough frames, or
+/// once confidently) becomes a depicts / title fact; the heads' low
+/// thresholds are for tracking, and the lake scores every triple alike, so
+/// one weak look must not become the first answer.
 void write_triples(std::ostream& out, const fs::path& src, const json& vmeta,
                    const std::vector<ehc::media::EncodedFrame>& encoded, const std::vector<FrameRecord>& records,
-                   int n_input, double fps, const ObjectLayerConfig& layer) {
+                   int n_input, double fps, const ObjectLayerConfig& layer, const std::set<long>& facts) {
     auto emit = [&](const std::string& s, const char* r, const std::string& o, const std::string& q = "") {
         out << json{{"subject", s}, {"relation", r}, {"object", o}, {"qualifier", q}}.dump() << "\n";
     };
@@ -173,7 +180,10 @@ void write_triples(std::ostream& out, const fs::path& src, const json& vmeta,
             emit(name(rec.scene), "location", f, ms);
         }
         std::vector<std::string> classes, words;
+        size_t n_fact = 0;
         for (const auto& b : rec.boxes) {
+            if (!facts.count(b.object_id)) continue;
+            ++n_fact;
             if (b.cls != "text" && std::find(classes.begin(), classes.end(), b.cls) == classes.end())
                 classes.push_back(b.cls);
             for (const auto& w : b.ocr)
@@ -189,7 +199,7 @@ void write_triples(std::ostream& out, const fs::path& src, const json& vmeta,
             emit(w, "depicted_by", f, ms);
             emit(w, "subtitle", f, ms);
         }
-        if (rec.boxes.empty()) emit(f, "facet_of", "no-box", ms);
+        if (n_fact == 0) emit(f, "facet_of", "no-box", ms);
     }
 }
 
@@ -388,6 +398,10 @@ int main(int argc, char** argv) {
         }
 
         vid_log << vmeta.dump() << "\n";
+        // The objects that become facts (config objects.min_frames / min_confidence).
+        std::set<long> facts;
+        for (const auto& o : objects)
+            if (opt.layer.corroborated(o)) facts.insert(o.object_id);
         std::vector<int64_t> row_of(encoded.size());
         for (size_t i = 0; i < encoded.size(); ++i) {
             auto& ef = encoded[i];
@@ -398,7 +412,7 @@ int main(int argc, char** argv) {
             if (!records.empty()) {
                 const auto& rec = records[i];
                 json boxes = json::array();
-                for (const auto& b : rec.boxes) boxes.push_back(box_json(b));
+                for (const auto& b : rec.boxes) boxes.push_back(box_json(b, facts.count(b.object_id) > 0));
                 overlay_log << json{{"video_id", ef.meta.video_id}, {"source_path", vmeta["source_path"]},
                                     {"frame_idx", ef.meta.frame_idx}, {"ts_ms", ef.meta.ts_ms},
                                     {"row_id", row_id}, {"frame_w", frame_w}, {"frame_h", frame_h},
@@ -417,6 +431,7 @@ int main(int argc, char** argv) {
             const auto& best = encoded[static_cast<size_t>(o.best_survivor)].meta;
             object_log << json{{"object_id", o.object_id}, {"video_id", vid_id}, {"class", o.cls},
                                {"source", o.source}, {"confidence", o.confidence}, {"ocr", o.ocr},
+                               {"fact", facts.count(o.object_id) > 0},
                                {"host_id", o.host_id >= 0 ? json(o.host_id) : json(nullptr)},
                                {"first_ts_ms", seen.front()["ts_ms"]}, {"last_ts_ms", seen.back()["ts_ms"]},
                                {"best", {{"frame_idx", best.frame_idx}, {"ts_ms", best.ts_ms},
@@ -424,7 +439,7 @@ int main(int argc, char** argv) {
                                {"frames", seen}}.dump()
                        << "\n";
         }
-        write_triples(triple_log, src, vmeta, encoded, records, n_input, args.fps, opt.layer);
+        write_triples(triple_log, src, vmeta, encoded, records, n_input, args.fps, opt.layer, facts);
         for (size_t i = 0; i < encoded.size(); ++i) {
             batch_vecs.push_back(std::move(encoded[i].vec));
             batch_ids.push_back(row_of[i]);

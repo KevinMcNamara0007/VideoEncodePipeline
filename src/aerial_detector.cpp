@@ -171,6 +171,10 @@ ObjectLayerConfig ObjectLayerConfig::load(const std::string& path, const std::st
         c.ocr_batch    = std::max(1, j["ocr"].value("batch", 32));
         for (const auto& k : j["ocr"].value("skip", nlohmann::json::array())) c.ocr_skip.insert(k.get<std::string>());
     }
+    if (j.contains("objects")) {
+        c.fact_min_confidence = j["objects"].value("min_confidence", 0.4);
+        c.fact_min_frames     = std::max(1, j["objects"].value("min_frames", 2));
+    }
     return c;
 }
 
@@ -190,7 +194,8 @@ nlohmann::ordered_json ObjectLayerConfig::to_json() const {
                       {"min_height", text_min_height}, {"pad", text_pad},
                       {"host_containment", text_host_containment}}},
             {"ocr", {{"min_side", ocr_min_side}, {"pad", ocr_pad}, {"views", ocr_views}, {"batch", ocr_batch},
-                     {"skip", ocr_skip}}}};
+                     {"skip", ocr_skip}}},
+            {"objects", {{"min_confidence", fact_min_confidence}, {"min_frames", fact_min_frames}}}};
 }
 
 // ── the reader thread ─────────────────────────────────────────────────────

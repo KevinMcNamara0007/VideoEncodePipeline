@@ -25,6 +25,9 @@ That builds `build/` if the binaries are missing (it needs EHC's
 heads to ONNX the first time, encodes `input/` into `out/`, and writes
 `output/preview.mp4`: the survivor keyframes with their boxes drawn, each
 labelled `class #object_id  TEXT`. `out/objects.jsonl` is the object index.
+An object becomes a fact for the appliance only when it is corroborated
+(seen on two frames, or once at confidence 0.4 or better; `objects` in the
+layer config); a withheld one is painted grey in the preview.
 
 Put the clip into the appliance:
 

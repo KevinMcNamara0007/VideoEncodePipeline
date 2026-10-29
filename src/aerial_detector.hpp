@@ -98,6 +98,16 @@ struct ObjectLayerConfig {
     int    text_min_height{10};
     double text_pad{0.3};
     double text_host_containment{0.6};
+    /// What makes an object a fact. The heads run low (coco 0.25, world
+    /// 0.20) so tracks stay continuous; a fact needs corroboration: the
+    /// object seen on fact_min_frames survivors, or once at or above
+    /// fact_min_confidence. An uncorroborated object stays in objects.jsonl
+    /// and the overlay (painted grey) but emits no triple.
+    double fact_min_confidence{0.4};
+    int    fact_min_frames{2};
+    bool corroborated(const ObjectEntry& o) const {
+        return static_cast<int>(o.survivors.size()) >= fact_min_frames || o.confidence >= fact_min_confidence;
+    }
 
     static ObjectLayerConfig load(const std::string& path, const std::string& root);
     nlohmann::ordered_json to_json() const;
