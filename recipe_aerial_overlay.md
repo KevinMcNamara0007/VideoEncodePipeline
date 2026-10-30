@@ -318,10 +318,20 @@ next survivor's timestamp (a frame the encoder dropped as a near-duplicate
 leaves its stand-in on screen for its slot), the last one for `--hold`
 seconds. Preview second `t` is source millisecond `1000 t`, so a fact's
 `point_in_time` seeks the preview with no lookup; `drone_raw.mp4` gives a
-169 s preview of 326 frames. The video's timestamps are in milliseconds
-(`-video_track_timescale 1000`): on ffmpeg's default 1/25 s track clock a
-half-second cue landed at 0.52 s, and a seek to "cue plus a little" sat on
-the frame boundary.
+169 s preview of 326 survivors in 338 slots. The video is built as one
+image per sample period (`out/preview_slots/slot_NNNNN.png`, links to the
+painted plates, a held survivor linked once per period) read by the image2
+demuxer at `-framerate <sample fps>`, so preview frame n sits at exactly
+n / fps, with millisecond timestamps (`-video_track_timescale 1000`).
+
+Two earlier layouts were wrong and are worth not repeating. The concat
+demuxer with `duration` entries on ffmpeg's default 1/25 s track clock put
+a half-second cue at 0.52 s. Re-clocked with `-r <fps> -fps_mode cfr` it
+looked right at the head of the clip but lost one frame at the first held
+cue (a 1 s entry, frame 20 standing in for dropped frame 21): from there
+every frame played 0.5 s ahead of its index entry, and the page, seeking to
+frame N, showed N+1 (measured 2026-10-30 by matching each of the 338
+preview frames to its plate: 305 off by one; the slot layout: 0).
 
 Beside the preview the step writes `preview.index.json`, the lookup the
 appliance's page reads to play the frames a fact names: `frames` (every

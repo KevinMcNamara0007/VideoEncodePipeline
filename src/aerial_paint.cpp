@@ -37,6 +37,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -291,25 +292,41 @@ int main(int argc, char** argv) {
         t += d;
     }
 
-    // Concat resolves relative paths from the list file's directory.
-    const fs::path lst = out_dir / "preview_frames.txt";
+    // One image per sample period, numbered in preview order, read by the
+    // image2 demuxer at -framerate fps: preview frame n sits at exactly n/fps,
+    // the clock the index describes. Every cue is a whole number of periods
+    // (survivors sit on the sample grid; a dropped frame's slot is one
+    // period), so a held survivor fills each of its periods; the slot files
+    // are links to the painted plates, not copies.
+    //
+    // The concat demuxer with `duration` entries, even re-clocked with
+    // -r/-fps_mode cfr, is NOT this clock: at the first held cue (a 1 s entry)
+    // it showed the next survivor one period early, and every later frame
+    // played 0.5 s ahead of its index entry -- 305 of 338 preview frames off
+    // by one on drone_raw, the player seeking to frame N and showing N+1
+    // (measured 2026-10-30 by matching each preview frame to its plate).
+    const fs::path slots = out_dir / "preview_slots";
     {
-        std::ofstream fh(lst);
-        for (const auto& c : cues)
-            fh << "file '" << fs::absolute(painted[c.row]).string() << "'\nduration " << c.duration << "\n";
-        fh << "file '" << fs::absolute(painted[cues.back().row]).string() << "'\n";
+        std::error_code ec;
+        fs::remove_all(slots, ec);  // a shorter run must not inherit stale slots
+        fs::create_directories(slots);
+        size_t n = 0;
+        for (const auto& c : cues) {
+            const long k = std::max(1L, std::lround(c.duration * fps));
+            for (long j = 0; j < k; ++j) {
+                char name[32];
+                std::snprintf(name, sizeof name, "slot_%05zu.png", n++);
+                fs::create_symlink(fs::absolute(painted[c.row]), slots / name, ec);
+                if (ec) die("cannot link " + (slots / name).string() + ": " + ec.message());
+            }
+        }
     }
     if (preview.has_parent_path()) fs::create_directories(preview.parent_path());
     try {
-        // Constant frame rate at the sample fps, millisecond timestamps. Every
-        // cue is a whole number of sample periods (survivors sit on the sample
-        // grid; a dropped frame's slot is one period), so CFR at that rate
-        // puts each cue exactly on its source time. The concat demuxer alone
-        // clocks images in 1/25 s and put a 0.5 s cue at 0.52.
         char rate[32];
         std::snprintf(rate, sizeof rate, "%.6g", fps);
-        (void)ehc::util::Subprocess::capture({"ffmpeg", "-y", "-nostdin", "-loglevel", "error", "-f", "concat",
-                                              "-safe", "0", "-i", lst.string(), "-r", rate, "-fps_mode", "cfr",
+        (void)ehc::util::Subprocess::capture({"ffmpeg", "-y", "-nostdin", "-loglevel", "error", "-framerate", rate,
+                                              "-i", (slots / "slot_%05d.png").string(),
                                               "-video_track_timescale", "1000", "-pix_fmt", "yuv420p",
                                               // moov first: a page seeking over HTTP Range reads the index
                                               // from the head of the file, not after a round trip to the tail.
