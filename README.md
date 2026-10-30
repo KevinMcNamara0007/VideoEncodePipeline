@@ -43,7 +43,14 @@ mounted as the pool `eworld`, places `preview.mp4`, `preview.index.json`,
 `frames.lsh` and `objects.jsonl` beside its shards under `media/`, checks
 the relics and the mount, and asks one question. On the appliance page a
 fact that names a frame then plays five frames of the preview from that
-frame (recipe section 6).
+frame (recipe section 6). The pool answers to the name `camera feed` (and
+any `--alias`) in a question's scope prefix: `camera feed: find all people
+near a tank` runs over this pool only, so a question the clip cannot answer
+declines instead of reading a passage from another corpus. Two facts whose
+boxes come within half a box of each other in a frame are near each other:
+`person near tank` is a subject of its own, shown in the frames where the
+crew stands at the tank, and the encoder ships the wordings it goes by
+(`people near a tank`, `person near the tank`) as the store's aliases.
 
 Build by hand:
 

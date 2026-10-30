@@ -398,6 +398,41 @@ duplicate boxes on the second (152, 156). "What is T441 shown in?" and
 override, not a fix for the detector; the detector fix stays on the open
 list.
 
+**Near.** The lake is an (subject, relation) lookup; "find all people near
+a tank" is a conjunction it cannot form at query time, and with no `near`
+in the store it declined ("names something the fabric has no relation
+for"). The encoder has the boxes, so it states the geometry: two
+corroborated facts in one frame are near each other when their boxes, each
+grown by `objects.near_reach` (0.5) of its own width and height on every
+side, overlap. Geometry, not the same shot: on drone_raw the FUEL stencil
+shares frames 318 to 320 with people who stand by another truck and is
+near none of them (same-frame would say 3, nearness says 0). For each near
+pair the frame depicts `person near tank` as a subject of its own
+(`depicted_by` the frame, so the five-frame player works unchanged), and
+the clip states `person near tank` / `tank near person` once. A hosted
+stencil is its vehicle's word, so the pair is the person and the word on
+the truck they stand by (`person near AMMO`), never a truck and its own
+lettering. Measured: 110 near pairs, triples 3,266 to 4,032; `person near
+tank` in frames 244 to 260 (12, the crew at T441), `person near truck` in
+71 frames, `person near FUEL` in none.
+
+The lake matches a question's span against a subject's surfaces as typed,
+so `people near a tank` reached nothing while `person near tank` answered:
+the plural and the article each broke the span. The store's alias relic
+(`aliases.jsonl`, surface to subject, read when `surfaces.ehmap` is
+emitted) is how a store says which wordings name a subject, and the
+encoder knows its own: it writes `out/aliases.jsonl` with the plural of
+each class (`people` for person, `trucks`, `tanks`) and, for each pair, the
+plural of either side and an article before the second (`people near a
+tank`, `person near the tank`, `people near tanks`); a stencil takes
+neither. `publish.sh` hands the file to the ingest door as
+`subject_aliases`, which copies it into the store before the relics.
+Measured on a copy of the store before the plumbing existed: with those
+wordings bound, "find all people near a tank" answers frames 244 to 260
+and "find all people near a truck" its 71 frames; "which frames show
+people near a tank" still declines (the verb `show` is not a `shown in`
+reading).
+
 Measured on `input/drone_raw.mp4` (3,330 triples, 383 subjects, every
 relation surfaced): of the 75 questions, 57 answer with a fact that is in
 the triples and 18 decline. Every decline is a fact that is not there: the
@@ -419,15 +454,20 @@ record-lane hop fix (branch `cpp`), or "What is B127 shown in?" answers
 or `--home`). It does four things, in this order, and prints each:
 
 1. **Ingest through the front door.** `POST /v1/ingest {source:
-   out/triples.jsonl, store: eworld}` on the appliance is HaloCore's
+   out/triples.jsonl, store: eworld, aliases: ["camera feed"],
+   subject_aliases: out/aliases.jsonl}` on the appliance is HaloCore's
    `ehc::ops::ingest`, the one call `halocore ingest` makes. It encodes the
    triples into the native store `<home>/data/stores/eworld/` (the
    appliance's ingest root), emits the serving relics as every ingest does
    (`subjects.tsv`, `surfaces.ehmap`, `sim_subjects.ehsim`,
    `sim_relations.ehsim`, `relation_surfaces.json`, `subj_index.bin`, the
    relation learner's files) and mounts the store as the pool `eworld`.
-   The appliance's `start.sh` walks the ingest root at boot, so the pool
-   comes back after a restart like every store under `MOE/`.
+   `aliases` becomes the store's `scope.json`, the names it answers to in
+   a question's scope prefix (below); `subject_aliases` is copied in as
+   the store's `aliases.jsonl` before the relics, so the surface map binds
+   the encoder's wordings to its subjects. The appliance's `start.sh`
+   walks the ingest root at boot, so the pool comes back after a restart
+   like every store under `MOE/`.
 2. **The preview and its lookups beside the shards.** `<store>/media/`
    gets `preview.mp4`, `preview.index.json`, `frames.lsh` (the keyframe
    vectors), `objects.jsonl` (the object index), `overlay.jsonl`,
@@ -453,6 +493,28 @@ names; the strip under the video lists the five frames (time, scene,
 objects and words) and clicking one seeks to it. This is
 `frontend/frame_playback.js` (L3M `halocore_v1`), one GET per store per
 page; a store without the sidecar changes nothing on the page.
+
+**The scope prefix: `camera feed: find all people near a tank`.** The
+appliance mounts seventy-odd pools, and a question the clip cannot answer
+used to fall past the lake to the passage reader of some other corpus
+("people near fuel" returned a line from a graph-theory book). A label
+before a colon and a space names the stores a question is for: a pool's
+name (`eworld:`), or an alias the store declares in its `scope.json`
+(`camera feed:`, which `publish.sh` gives every pool it publishes, plus
+any `--alias`). HaloCore's query door (`ehc/sim/ask.hpp`) resolves it and
+runs every stage over those stores only, including the record lanes, the
+passage reader and the appliance's document pools; the reply carries
+`scope: {label, stores}`, and a decline says `in camera feed: ...`. The
+question after the colon is unchanged, so everything that works without
+the prefix works with it. A label no store answers to is left in the
+question; `site:AUH-00001` (no space after the colon) is a record id. The
+same prefix works on the CLI: `halocore query --text "camera feed: what
+is near the tank?"` over the same mounts. Measured through `/v1/chat`
+after the install: the three questions ("find all people near a tank",
+"near a truck", "near fuel") answer frames 244 to 260, the 71 truck
+frames, and a clean decline inside the camera feed; "what is near the
+tank?" stops going to the wiki pool's thesaurus ids and answers from the
+clip.
 
 ## OpenCV as its own detector
 

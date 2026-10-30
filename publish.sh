@@ -17,28 +17,33 @@
 #
 #   ./publish.sh <name> [--out out] [--preview output/preview.mp4]
 #                       [--home /opt/mpl] [--replace] [--ask "question"]
+#                       [--alias NAME]...
 #
 # --replace unmounts and removes an existing store of that name first (the
 # store is this clip's encode; nothing else lives there). The appliance's
-# start.sh remounts every store under the ingest root at boot.
+# start.sh remounts every store under the ingest root at boot. The pool
+# answers to "camera feed" (and any --alias) in a question's scope prefix:
+# "camera feed: find all people near a tank" runs over this pool only.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 NAME=""; OUT="$ROOT/out"; PREVIEW="$ROOT/output/preview.mp4"; MPL="${MPL_HOME:-/opt/mpl}"
 REPLACE=0; ASK="What is the story setting of frame 26?"
+ALIASES=("camera feed")   # the names the pool answers to in a "<name>: question" scope prefix
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --out) OUT="$2"; shift 2 ;;
     --preview) PREVIEW="$2"; shift 2 ;;
     --home) MPL="$2"; shift 2 ;;
     --replace) REPLACE=1; shift ;;
+    --alias) ALIASES+=("$2"); shift 2 ;;
     --ask) ASK="$2"; shift 2 ;;
     -h|--help) sed -n '9,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown option $1" >&2; exit 2 ;;
     *) [[ -z "$NAME" ]] && NAME="$1" || { echo "one name only" >&2; exit 2; }; shift ;;
   esac
 done
-[[ -n "$NAME" ]] || { echo "usage: publish.sh <name> [--out DIR] [--preview MP4] [--home DIR] [--replace]" >&2; exit 2; }
+[[ -n "$NAME" ]] || { echo "usage: publish.sh <name> [--out DIR] [--preview MP4] [--home DIR] [--replace] [--alias NAME]..." >&2; exit 2; }
 [[ "$NAME" =~ ^[a-z0-9_]+$ ]] || { echo "name must be [a-z0-9_]+ (it is the pool name)" >&2; exit 2; }
 OUT="$(cd "$OUT" && pwd)"
 [[ -s "$OUT/triples.jsonl" ]] || { echo "no $OUT/triples.jsonl (run ./run.sh first)" >&2; exit 1; }
@@ -83,12 +88,23 @@ if [[ -e "$STORE" ]]; then
 fi
 
 # ── 2. the HaloCore ingest front door ─────────────────────────────────────
-say "ingest $OUT/triples.jsonl -> $STORE (POST $URL/v1/ingest)"
-RES="$(curl -s --max-time 600 -X POST "$URL/v1/ingest" "${AUTH[@]}" -H 'Content-Type: application/json' \
-  -d "{\"source\":\"$OUT/triples.jsonl\",\"store\":\"$NAME\"}")"
+#   aliases: the names the pool answers to in a question's scope prefix
+#   ("camera feed: find all people near a tank") -> <store>/scope.json;
+#   subject_aliases: the wordings the encoder says its subjects go by
+#   (out/aliases.jsonl: "people near a tank" -> "person near tank") -> the
+#   store's aliases.jsonl, read when its surface map is emitted.
+SUBJ_ALIASES=""; [[ -s "$OUT/aliases.jsonl" ]] && SUBJ_ALIASES="$OUT/aliases.jsonl"
+BODY="$(python3 -c 'import json,sys
+print(json.dumps({"source": sys.argv[1], "store": sys.argv[2], "aliases": [a for a in sys.argv[4:] if a],
+                  **({"subject_aliases": sys.argv[3]} if sys.argv[3] else {})}))' \
+  "$OUT/triples.jsonl" "$NAME" "$SUBJ_ALIASES" "${ALIASES[@]}")"
+say "ingest $OUT/triples.jsonl -> $STORE (POST $URL/v1/ingest; aliases: ${ALIASES[*]}${SUBJ_ALIASES:+; subject aliases: $(wc -l < "$SUBJ_ALIASES" | tr -d ' ') wordings})"
+RES="$(curl -s --max-time 600 -X POST "$URL/v1/ingest" "${AUTH[@]}" -H 'Content-Type: application/json' -d "$BODY")"
 [[ "$(printf '%s' "$RES" | jget ok)" == "True" ]] || die "ingest failed: $RES"
 say "ingested $(printf '%s' "$RES" | jget records) records, mounted=$(printf '%s' "$RES" | jget mounted)"
 [[ -f "$STORE/manifest.json" ]] || die "no store at $STORE after the ingest"
+[[ -f "$STORE/scope.json" ]] && say "scope: $(cat "$STORE/scope.json" | tr -d '\n')"
+[[ -f "$STORE/aliases.jsonl" ]] && say "subject aliases in the store: $(wc -l < "$STORE/aliases.jsonl" | tr -d ' ')"
 
 # ── 3. the preview and its lookups, beside the shards ─────────────────────
 mkdir -p "$STORE/media"

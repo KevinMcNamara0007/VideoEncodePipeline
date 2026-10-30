@@ -75,6 +75,24 @@ struct ObjectEntry {
     std::string              detected;          // the voted class a correction replaced
 };
 
+/// Whether two boxes (x1, y1, x2, y2) are near each other: each grown by
+/// `reach` of its own width and height on every side, the grown boxes
+/// overlap. reach 0 is touching; 0.5 reaches half a box past its edge.
+template <class A, class B>
+bool near_boxes(const A& a, const B& b, double reach) {
+    auto grow = [reach](const auto& x, double* g) {
+        const double w = static_cast<double>(x[2]) - x[0], h = static_cast<double>(x[3]) - x[1];
+        g[0] = x[0] - reach * w;
+        g[1] = x[1] - reach * h;
+        g[2] = x[2] + reach * w;
+        g[3] = x[3] + reach * h;
+    };
+    double ga[4], gb[4];
+    grow(a, ga);
+    grow(b, gb);
+    return !(ga[2] < gb[0] || gb[2] < ga[0] || ga[3] < gb[1] || gb[3] < ga[1]);
+}
+
 /// config/object_layer.json, with paths resolved against `root`.
 struct ObjectLayerConfig {
     std::string coco_model;
@@ -112,6 +130,11 @@ struct ObjectLayerConfig {
         return o.manual || static_cast<int>(o.survivors.size()) >= fact_min_frames ||
                o.confidence >= fact_min_confidence;
     }
+    /// Two facts in one frame are near each other when their boxes, each
+    /// grown by near_reach of its own width and height on every side,
+    /// overlap (near_boxes). Geometry, not the same shot: the lake gets
+    /// "person near tank" only for the people at the tank.
+    double near_reach{0.5};
 
     static ObjectLayerConfig load(const std::string& path, const std::string& root);
     nlohmann::ordered_json to_json() const;

@@ -26,6 +26,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <cctype>
+#include <cstring>
 #include <map>
 #include <set>
 #include <sstream>
@@ -134,7 +136,53 @@ json box_json(const Box& b, bool fact) {
 /// once confidently) becomes a depicts / title fact; the heads' low
 /// thresholds are for tracking, and the lake scores every triple alike, so
 /// one weak look must not become the first answer.
-void write_triples(std::ostream& out, const fs::path& src, const json& vmeta,
+/// The wordings a subject goes by, for the store's alias relic
+/// (aliases.jsonl: surface -> subject; the ingest door copies it in before
+/// the relics, so surfaces.ehmap binds the wording to the subject). The
+/// lake matches a question's span against a subject's surfaces as typed, so
+/// "people near a tank" reaches "person near tank" only if the store says
+/// so. The plural of a class, and for a pair "X near Y" the plural of X and
+/// Y and an article before Y. A stencil (T441, B127) has no plural and takes
+/// no article.
+std::string plural_of(const std::string& w) {
+    static const std::map<std::string, std::string> irregular{{"person", "people"}};
+    if (w.empty()) return "";
+    if (const auto it = irregular.find(w); it != irregular.end()) return it->second;
+    for (unsigned char c : w)
+        if (std::isdigit(c) || std::isupper(c)) return "";
+    const size_t sp = w.rfind(' ');
+    const std::string head = sp == std::string::npos ? "" : w.substr(0, sp + 1);
+    const std::string last = sp == std::string::npos ? w : w.substr(sp + 1);
+    if (last.size() < 2 || last.back() == 's') return "";
+    auto vowel = [](char c) { return std::strchr("aeiou", c) != nullptr; };
+    if (last.back() == 'y' && !vowel(last[last.size() - 2])) return head + last.substr(0, last.size() - 1) + "ies";
+    return head + last + "s";
+}
+
+void write_aliases(std::ostream& out, const std::set<std::string>& classes,
+                   const std::set<std::pair<std::string, std::string>>& near_pairs) {
+    std::set<std::string> seen;
+    auto emit = [&](const std::string& surface, const std::string& subject) {
+        if (surface.empty() || surface == subject || !seen.insert(surface).second) return;
+        out << json{{"surface", surface}, {"subject", subject}}.dump() << "\n";
+    };
+    auto article = [](const std::string& w) -> std::string {
+        for (unsigned char c : w)
+            if (std::isdigit(c) || std::isupper(c)) return "";
+        return (std::strchr("aeiou", w[0]) ? "an " : "a ") + w;
+    };
+    for (const auto& c : classes) emit(plural_of(c), c);
+    for (const auto& [x, y] : near_pairs) {
+        const std::string subject = x + " near " + y;
+        for (const std::string& xf : {x, plural_of(x)}) {
+            if (xf.empty()) continue;
+            for (const std::string& yf : {y, article(y), "the " + y, plural_of(y)})
+                if (!yf.empty()) emit(xf + " near " + yf, subject);
+        }
+    }
+}
+
+void write_triples(std::ostream& out, std::ostream& aliases, const fs::path& src, const json& vmeta,
                    const std::vector<ehc::media::EncodedFrame>& encoded, const std::vector<FrameRecord>& records,
                    int n_input, double fps, const ObjectLayerConfig& layer, const std::set<long>& facts) {
     auto emit = [&](const std::string& s, const char* r, const std::string& o, const std::string& q = "") {
@@ -174,6 +222,16 @@ void write_triples(std::ostream& out, const fs::path& src, const json& vmeta,
         const auto it = stands_for.find(idx);
         if (it != stands_for.end() && it->second != idx) emit(frame(idx), "said_to_be_the_same_as", frame(it->second), ms);
     }
+    // Nearness (layer.near_reach): two facts whose boxes come within reach
+    // of each other in a frame. The frame depicts "person near tank" (a
+    // subject of its own, so "find all people near a tank" is the same
+    // (subject, shown in) lookup as "what is the tank shown in"), and the
+    // clip states person near tank once, both ways round. A hosted stencil
+    // is its vehicle's word (AMMO on the truck), so the pair is the person
+    // and the word on the truck they stand by, never a truck and its own
+    // lettering.
+    std::set<std::pair<std::string, std::string>> near_pairs;
+    std::set<std::string> class_names;
     for (size_t i = 0; i < encoded.size() && i < records.size(); ++i) {
         const int idx = encoded[i].meta.frame_idx;
         const std::string f = frame(idx), ms = ms_of(idx);
@@ -195,6 +253,7 @@ void write_triples(std::ostream& out, const fs::path& src, const json& vmeta,
         for (const auto& c : classes) {
             emit(f, "depicts", name(c), ms);
             emit(name(c), "depicted_by", f, ms);
+            class_names.insert(name(c));
         }
         for (const auto& w : words) {
             emit(f, "subtitle", w, ms);
@@ -203,7 +262,35 @@ void write_triples(std::ostream& out, const fs::path& src, const json& vmeta,
             emit(w, "subtitle", f, ms);
         }
         if (n_fact == 0) emit(f, "facet_of", "no-box", ms);
+
+        std::vector<std::pair<const Box*, std::vector<std::string>>> named;
+        for (const auto& b : rec.boxes) {
+            if (!facts.count(b.object_id)) continue;
+            std::vector<std::string> ns;
+            if (b.cls != "text") ns.push_back(name(b.cls));
+            for (const auto& w : b.ocr)
+                if (std::find(ns.begin(), ns.end(), w) == ns.end()) ns.push_back(w);
+            if (!ns.empty()) named.emplace_back(&b, std::move(ns));
+        }
+        std::vector<std::string> near_here;
+        for (size_t a = 0; a < named.size(); ++a)
+            for (size_t c = a + 1; c < named.size(); ++c) {
+                if (named[a].first->object_id == named[c].first->object_id) continue;
+                if (!near_boxes(named[a].first->xyxy, named[c].first->xyxy, layer.near_reach)) continue;
+                for (const auto& x : named[a].second)
+                    for (const auto& y : named[c].second) {
+                        if (x == y) continue;
+                        for (const std::string& p : {x + " near " + y, y + " near " + x})
+                            if (std::find(near_here.begin(), near_here.end(), p) == near_here.end())
+                                near_here.push_back(p);
+                        near_pairs.insert({x, y});
+                        near_pairs.insert({y, x});
+                    }
+            }
+        for (const auto& p : near_here) emit(p, "depicted_by", f, ms);
     }
+    for (const auto& [x, y] : near_pairs) emit(x, "near", y);
+    write_aliases(aliases, class_names, near_pairs);
 }
 
 struct Args {
@@ -458,7 +545,8 @@ int main(int argc, char** argv) {
     ehc::index::BSCLSHIndex lsh(cfg.dim, cfg.k, kNumTables, kHashSize);
     std::ofstream vid_log(args.out_dir / "videos.jsonl"), frame_log(args.out_dir / "frames.jsonl"),
         overlay_log(args.out_dir / "overlay.jsonl"), object_log(args.out_dir / "objects.jsonl"),
-        triple_log(args.out_dir / "triples.jsonl"), enc_log(args.out_dir / "encode_log.jsonl");
+        triple_log(args.out_dir / "triples.jsonl"), alias_log(args.out_dir / "aliases.jsonl"),
+        enc_log(args.out_dir / "encode_log.jsonl");
 
     std::vector<ehc::core::SparseVector> batch_vecs;
     std::vector<int64_t> batch_ids;
@@ -551,7 +639,7 @@ int main(int argc, char** argv) {
                                {"frames", seen}}.dump()
                        << "\n";
         }
-        write_triples(triple_log, src, vmeta, encoded, records, n_input, args.fps, opt.layer, facts);
+        write_triples(triple_log, alias_log, src, vmeta, encoded, records, n_input, args.fps, opt.layer, facts);
         for (size_t i = 0; i < encoded.size(); ++i) {
             batch_vecs.push_back(std::move(encoded[i].vec));
             batch_ids.push_back(row_of[i]);
