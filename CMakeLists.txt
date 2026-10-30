@@ -76,3 +76,7 @@ target_link_libraries(ocr_dump PRIVATE eworld_core)
 # The reader bench: the same crops through Tesseract or the door, timed.
 add_executable(ocr_bench tests/ocr_bench.cpp)
 target_link_libraries(ocr_bench PRIVATE eworld_core)
+
+# A conjunction asked of the frame vectors by superposition (tests/scene_probe.cpp).
+add_executable(scene_probe tests/scene_probe.cpp)
+target_link_libraries(scene_probe PRIVATE eworld_core)

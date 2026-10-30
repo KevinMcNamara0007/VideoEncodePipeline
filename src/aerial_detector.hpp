@@ -130,11 +130,13 @@ struct ObjectLayerConfig {
         return o.manual || static_cast<int>(o.survivors.size()) >= fact_min_frames ||
                o.confidence >= fact_min_confidence;
     }
-    /// Two facts in one frame are near each other when their boxes, each
-    /// grown by near_reach of its own width and height on every side,
-    /// overlap (near_boxes). Geometry, not the same shot: the lake gets
-    /// "person near tank" only for the people at the tank.
-    double near_reach{0.5};
+    /// Two facts in one frame are BESIDE each other when their boxes, each
+    /// grown by beside_reach of its own width and height on every side,
+    /// overlap (near_boxes). Geometry, the strict reading: the lake gets
+    /// "person beside tank" only for the people at the tank. "Near" is
+    /// co-presence in the frame, and that is the reasoning layer's join over
+    /// the depicts rows, not the encoder's.
+    double beside_reach{0.5};
 
     static ObjectLayerConfig load(const std::string& path, const std::string& root);
     nlohmann::ordered_json to_json() const;

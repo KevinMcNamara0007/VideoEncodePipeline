@@ -22,14 +22,21 @@
 # --replace unmounts and removes an existing store of that name first (the
 # store is this clip's encode; nothing else lives there). The appliance's
 # start.sh remounts every store under the ingest root at boot. The pool
-# answers to "camera feed" (and any --alias) in a question's scope prefix:
-# "camera feed: find all people near a tank" runs over this pool only.
+# answers to the names in config/scope.json ("camera feed", "drone") and any
+# --alias in a question's scope prefix: "camera feed: find all people near
+# fuel" runs over this pool only.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 NAME=""; OUT="$ROOT/out"; PREVIEW="$ROOT/output/preview.mp4"; MPL="${MPL_HOME:-/opt/mpl}"
 REPLACE=0; ASK="What is the story setting of frame 26?"
-ALIASES=("camera feed")   # the names the pool answers to in a "<name>: question" scope prefix
+# The names the pool answers to in a "<name>: question" scope prefix:
+# config/scope.json (a surface, not a script constant), plus any --alias.
+ALIASES=()
+if [[ -s "$ROOT/config/scope.json" ]]; then
+  while IFS= read -r a; do [[ -n "$a" ]] && ALIASES+=("$a"); done < <(python3 -c 'import json,sys
+for a in json.load(open(sys.argv[1])).get("aliases", []): print(a)' "$ROOT/config/scope.json")
+fi
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --out) OUT="$2"; shift 2 ;;
@@ -98,7 +105,7 @@ BODY="$(python3 -c 'import json,sys
 print(json.dumps({"source": sys.argv[1], "store": sys.argv[2], "aliases": [a for a in sys.argv[4:] if a],
                   **({"subject_aliases": sys.argv[3]} if sys.argv[3] else {})}))' \
   "$OUT/triples.jsonl" "$NAME" "$SUBJ_ALIASES" "${ALIASES[@]}")"
-say "ingest $OUT/triples.jsonl -> $STORE (POST $URL/v1/ingest; aliases: ${ALIASES[*]}${SUBJ_ALIASES:+; subject aliases: $(wc -l < "$SUBJ_ALIASES" | tr -d ' ') wordings})"
+say "ingest $OUT/triples.jsonl -> $STORE (POST $URL/v1/ingest; scope aliases: ${ALIASES[*]:-none}${SUBJ_ALIASES:+; subject aliases: $(wc -l < "$SUBJ_ALIASES" | tr -d ' ') wordings})"
 RES="$(curl -s --max-time 600 -X POST "$URL/v1/ingest" "${AUTH[@]}" -H 'Content-Type: application/json' -d "$BODY")"
 [[ "$(printf '%s' "$RES" | jget ok)" == "True" ]] || die "ingest failed: $RES"
 say "ingested $(printf '%s' "$RES" | jget records) records, mounted=$(printf '%s' "$RES" | jget mounted)"

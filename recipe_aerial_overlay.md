@@ -398,40 +398,54 @@ duplicate boxes on the second (152, 156). "What is T441 shown in?" and
 override, not a fix for the detector; the detector fix stays on the open
 list.
 
-**Near.** The lake is an (subject, relation) lookup; "find all people near
-a tank" is a conjunction it cannot form at query time, and with no `near`
-in the store it declined ("names something the fabric has no relation
-for"). The encoder has the boxes, so it states the geometry: two
-corroborated facts in one frame are near each other when their boxes, each
-grown by `objects.near_reach` (0.5) of its own width and height on every
-side, overlap. Geometry, not the same shot: on drone_raw the FUEL stencil
-shares frames 318 to 320 with people who stand by another truck and is
-near none of them (same-frame would say 3, nearness says 0). For each near
-pair the frame depicts `person near tank` as a subject of its own
-(`depicted_by` the frame, so the five-frame player works unchanged), and
-the clip states `person near tank` / `tank near person` once. A hosted
-stencil is its vehicle's word, so the pair is the person and the word on
-the truck they stand by (`person near AMMO`), never a truck and its own
-lettering. Measured: 110 near pairs, triples 3,266 to 4,032; `person near
-tank` in frames 244 to 260 (12, the crew at T441), `person near truck` in
-71 frames, `person near FUEL` in none.
+**Near is a join, beside is geometry.** "Find all people near fuel" asks
+for the frames that hold both. The lake already has every row that needs:
+`person depicted_by frame 318`, `FUEL depicted_by frame 318`. What was
+missing was the operation: the answer loop (EHC
+`ehc::reasoning::loop::run`) walked chains out of one subject, and in a
+two-subject question the other subject's own word stays in every chain's
+residual, so it read FUEL's rows, including those frames, and said
+"absent". The superposition route was measured first (`tests/scene_probe.cpp`:
+the question's words grounded to every token kind, superposed into one
+probe, scored against every frame vector): the signal is there but it
+ranks by how much of the probe a frame holds, so a frame with only
+`person` outranks the frames that hold person AND FUEL (8th and 10th of
+326), and the LSH bands returned nothing at all. A conjunction is not a
+rank. The loop now has a JOIN reading (2026-10-29): when two or three
+subjects are grounded and the words left over are connectives (near, and,
+with, beside, ...) or name a relation, the answer is the intersection of
+the subjects' exact rows under one relation, one reading with every shared
+object, so the router sees an answer set and the reply carries each
+subject's fact for each frame. "Find all" is let through the loop's guard
+(the `all` is the listing verb's). Measured: `camera feed: find all people
+near fuel` answers frames 318, 319, 320; `people near helicopters` declines
+honestly (no frame holds both).
+
+The strict reading is the encoder's: two corroborated facts in one frame
+are BESIDE each other when their boxes, each grown by
+`objects.beside_reach` (0.5) of its own width and height on every side,
+overlap. On drone_raw the FUEL stencil shares frames 318 to 320 with people
+who stand by another truck and is beside none of them. For each pair the
+frame depicts `person beside tank` as a subject of its own (`depicted_by`
+the frame, so the five-frame player works unchanged), and the clip states
+`person beside tank` / `tank beside person` once. A hosted stencil is its
+vehicle's word, so the pair is the person and the word on the truck they
+stand by (`person beside AMMO`), never a truck and its own lettering.
+Measured: 110 pairs, triples 3,266 to 4,032; `person beside tank` in frames
+244 to 260 (12, the crew at T441), `person beside truck` in 71 frames.
 
 The lake matches a question's span against a subject's surfaces as typed,
-so `people near a tank` reached nothing while `person near tank` answered:
-the plural and the article each broke the span. The store's alias relic
-(`aliases.jsonl`, surface to subject, read when `surfaces.ehmap` is
+so `people beside a tank` reaches nothing while `person beside tank`
+answers: the plural and the article each break the span. The store's alias
+relic (`aliases.jsonl`, surface to subject, read when `surfaces.ehmap` is
 emitted) is how a store says which wordings name a subject, and the
 encoder knows its own: it writes `out/aliases.jsonl` with the plural of
 each class (`people` for person, `trucks`, `tanks`) and, for each pair, the
-plural of either side and an article before the second (`people near a
-tank`, `person near the tank`, `people near tanks`); a stencil takes
+plural of either side and an article before the second (`people beside a
+tank`, `person beside the tank`, `people beside tanks`); a stencil takes
 neither. `publish.sh` hands the file to the ingest door as
-`subject_aliases`, which copies it into the store before the relics.
-Measured on a copy of the store before the plumbing existed: with those
-wordings bound, "find all people near a tank" answers frames 244 to 260
-and "find all people near a truck" its 71 frames; "which frames show
-people near a tank" still declines (the verb `show` is not a `shown in`
-reading).
+`subject_aliases`, which copies it into the store before the relics. The
+class plurals are what let the join ground `people` and `trucks` too.
 
 Measured on `input/drone_raw.mp4` (3,330 triples, 383 subjects, every
 relation surfaced): of the 75 questions, 57 answer with a fact that is in
@@ -500,8 +514,9 @@ used to fall past the lake to the passage reader of some other corpus
 ("people near fuel" returned a line from a graph-theory book). A label
 before a colon and a space names the stores a question is for: a pool's
 name (`eworld:`), or an alias the store declares in its `scope.json`
-(`camera feed:`, which `publish.sh` gives every pool it publishes, plus
-any `--alias`). HaloCore's query door (`ehc/sim/ask.hpp`) resolves it and
+(`camera feed:`, `drone:`: the names in this repo's `config/scope.json`,
+which `publish.sh` gives every pool it publishes, plus any `--alias`; a
+new phrase is a line there, not a script edit). HaloCore's query door (`ehc/sim/ask.hpp`) resolves it and
 runs every stage over those stores only, including the record lanes, the
 passage reader and the appliance's document pools; the reply carries
 `scope: {label, stores}`, and a decline says `in camera feed: ...`. The
@@ -510,11 +525,10 @@ the prefix works with it. A label no store answers to is left in the
 question; `site:AUH-00001` (no space after the colon) is a record id. The
 same prefix works on the CLI: `halocore query --text "camera feed: what
 is near the tank?"` over the same mounts. Measured through `/v1/chat`
-after the install: the three questions ("find all people near a tank",
-"near a truck", "near fuel") answer frames 244 to 260, the 71 truck
-frames, and a clean decline inside the camera feed; "what is near the
-tank?" stops going to the wiki pool's thesaurus ids and answers from the
-clip.
+after the install: "find all people near a tank", "near a truck" and
+"near fuel" each answer the frames that hold both (the join above), and
+"what is near the tank?" stops going to the wiki pool's thesaurus ids and
+answers from the clip.
 
 ## OpenCV as its own detector
 

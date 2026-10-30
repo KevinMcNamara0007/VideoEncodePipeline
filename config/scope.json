@@ -1,0 +1,4 @@
+{
+  "_doc": "The names every pool this repo publishes answers to in a question's scope prefix (\"camera feed: find all people near fuel\"). publish.sh hands them to the ingest door as `aliases`; the door writes them to the store's own scope.json, and HaloCore's query door resolves the prefix against that file and the pool's name. A new phrase is a line here (or --alias on the command line), not a script edit. The syntax is the label, a colon and a space: a colon with no space after it is a record id (site:AUH-00001), never a scope.",
+  "aliases": ["camera feed", "drone"]
+}
